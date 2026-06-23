@@ -1,0 +1,26 @@
+{
+  "metrics": {
+    "r2": 0.9978882291441761,
+    "mae": 2.9180236677310094,
+    "rmse": 5.641814445254094,
+    "n_train": 78840,
+    "n_test": 26280,
+    "mean_target": 88.92847279853461
+  },
+  "feature_importance": {
+    "system_on": 0.7763,
+    "t_out": 0.1773,
+    "vent_frac": 0.0228,
+    "fan_factor": 0.0094,
+    "heat_set": 0.0078,
+    "cool_set": 0.003,
+    "deadband": 0.0029,
+    "occ_frac": 0.0004,
+    "solar": 0.0002,
+    "hour": 0.0,
+    "dayofweek": 0.0,
+    "is_workday": 0.0,
+    "month": 0.0
+  },
+  "baseline_annual_kwh": 999786.6711562118
+}
