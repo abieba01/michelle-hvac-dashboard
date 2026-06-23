@@ -16,6 +16,7 @@ import config as C
 import data_generator as dg
 from energy_model import train, predict_annual_kwh
 from hvac_optimizer import SCENARIOS, PRETTY
+from report import generate_pdf
 
 st.set_page_config(page_title="Michelle's Project – HVAC Optimisation Dashboard", layout="wide")
 
@@ -375,7 +376,7 @@ styled = (
 st.dataframe(styled, use_container_width=True, hide_index=True)
 
 with st.expander("Download data"):
-    dl1, dl2 = st.columns(2)
+    dl1, dl2, dl3 = st.columns(3)
     dl1.download_button(
         label=f"Hourly dataset ({len(raw_data):,} rows)",
         data=raw_data.to_csv(index=False).encode(),
@@ -389,6 +390,23 @@ with st.expander("Download data"):
         file_name="hvac_scenario_results.csv",
         mime="text/csv",
         help="The five-row summary with current slider values applied.",
+    )
+    pdf_assumptions = {
+        "elec_price":    elec_price,
+        "carbon_factor": carbon_factor,
+        "discount_rate": discount_rate,
+        "lifetime":      lifetime,
+        "capex_occ":     capex_occ,
+        "capex_therm":   capex_therm,
+        "capex_bas":     capex_bas,
+        "capex_comb":    capex_comb,
+    }
+    dl3.download_button(
+        label="Full PDF report",
+        data=generate_pdf(df, pdf_assumptions, metrics, data_label),
+        file_name="hvac_optimisation_report.pdf",
+        mime="application/pdf",
+        help="Professional PDF with results table, charts, and recommendations based on current slider values.",
     )
 
 st.divider()
