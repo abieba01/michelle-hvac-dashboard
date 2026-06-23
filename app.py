@@ -17,7 +17,7 @@ import data_generator as dg
 from energy_model import train, predict_annual_kwh
 from hvac_optimizer import SCENARIOS, PRETTY
 
-st.set_page_config(page_title="HVAC Optimisation Dashboard", layout="wide")
+st.set_page_config(page_title="Michelle's Project – HVAC Optimisation Dashboard", layout="wide")
 
 PALETTE = ["#1f4e79", "#2e75b6", "#5b9bd5", "#9dc3e6", "#c55a11"]
 
@@ -305,7 +305,7 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 # Load data (one branch per data source)
 # ---------------------------------------------------------------------------
-st.title("HVAC Optimisation Dashboard")
+st.title("Michelle's Project – HVAC Optimisation Dashboard")
 
 upload_warnings: list[str] = []
 
