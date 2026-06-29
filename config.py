@@ -12,18 +12,23 @@ the project report (10,000 m2, ~2,000,000 kWh/yr, HVAC ~= 50% of load).
 # ----------------------------------------------------------------------------
 # Building physical description
 # ----------------------------------------------------------------------------
-FLOOR_AREA_M2 = 10_000          # gross internal floor area
-PEAK_OCCUPANCY = 500            # design occupancy (people)
-OPEN_HOUR = 8                   # nominal building open time (local)
-CLOSE_HOUR = 18                 # nominal building close time (local)
-WORKDAYS = {0, 1, 2, 3, 4}     # Monday=0 ... Sunday=6
+FLOOR_AREA_M2 = 10_000              # gross internal floor area (m²)
+OCCUPANCY_DENSITY_M2 = 20           # m² per person (CIBSE Guide A office default)
+PEAK_OCCUPANCY = FLOOR_AREA_M2 // OCCUPANCY_DENSITY_M2   # 500 for default building
+OPEN_HOUR = 8                       # nominal building open time (local)
+CLOSE_HOUR = 18                     # nominal building close time (local)
+WORKDAYS = {0, 1, 2, 3, 4}         # Monday=0 ... Sunday=6
+
+# Default building type (must match a key in building_profiles.PROFILES)
+DEFAULT_BUILDING_TYPE = "office"
 
 # ----------------------------------------------------------------------------
 # Energy baseline (used to calibrate the synthetic generator)
 # ----------------------------------------------------------------------------
-ANNUAL_ELECTRICITY_KWH = 2_000_000      # whole-building electricity
+HVAC_ENERGY_INTENSITY_KWH_M2 = 100      # kWh/m²/yr HVAC (CIBSE TM46 typical office)
+TARGET_ANNUAL_HVAC_KWH = HVAC_ENERGY_INTENSITY_KWH_M2 * FLOOR_AREA_M2  # 1,000,000
+ANNUAL_ELECTRICITY_KWH = 2_000_000      # whole-building electricity (kept for reference)
 HVAC_SHARE_OF_LOAD = 0.50               # HVAC fraction of total electricity
-TARGET_ANNUAL_HVAC_KWH = ANNUAL_ELECTRICITY_KWH * HVAC_SHARE_OF_LOAD  # 1,000,000
 
 # ----------------------------------------------------------------------------
 # Economic and environmental factors
@@ -52,10 +57,78 @@ SETBACK_COOLING = 27.0          # unoccupied relaxed cooling target
 SETBACK_HEATING = 15.0          # unoccupied relaxed heating target
 
 # ----------------------------------------------------------------------------
+# Equipment degradation and maintenance (Phase 1 additions)
+# ----------------------------------------------------------------------------
+DEGRADATION_RATE = 0.015        # annual efficiency decline (1.5 %/yr) applied in NPV
+MAINTENANCE_COSTS = {           # annual maintenance cost per strategy (GBP/yr)
+    "occupancy_scheduling": 2_000,
+    "smart_thermostats":    1_000,
+    "bas":                  8_000,
+    "combined":             10_000,
+}
+
+# ----------------------------------------------------------------------------
 # Simulation period
 # ----------------------------------------------------------------------------
 SIM_YEARS = 3                   # years of synthetic hourly data to generate
 RANDOM_SEED = 42
+
+# ----------------------------------------------------------------------------
+# Phase 2 — energy prices and carbon
+# ----------------------------------------------------------------------------
+GAS_PRICE        = 0.07         # GBP/kWh natural gas (commercial tariff)
+GAS_CARBON       = 0.203        # kgCO2e/kWh natural gas
+INFLATION_RATE   = 0.035        # annual energy price inflation for NPV
+GRANT_PCT        = 0.0          # default grant / subsidy (% of CAPEX)
+
+# ----------------------------------------------------------------------------
+# Phase 2 — LED lighting defaults
+# ----------------------------------------------------------------------------
+LIGHTING_HOURS_PER_YEAR = 2_250     # operating hours/year (typical office)
+LIGHTING_LIFETIME_YEARS = 20        # LED lamp life before replacement
+
+# ----------------------------------------------------------------------------
+# Phase 2 — solar PV defaults
+# ----------------------------------------------------------------------------
+SOLAR_PV_PERF_RATIO  = 0.80         # system performance ratio (losses)
+SOLAR_PV_EXPORT_TARIFF = 0.15       # GBP/kWh Smart Export Guarantee rate
+SOLAR_PV_LIFETIME    = 25           # years (panel warranty period)
+SOLAR_PV_DEGRADATION = 0.005        # 0.5 %/yr panel output degradation
+
+# UK self-consumption fraction by building type (solar peaks during occupancy)
+SOLAR_SELF_CONSUMPTION = {
+    "office": 0.65, "hotel": 0.30, "hospital": 0.70,
+    "school": 0.55, "retail": 0.60, "industrial": 0.65,
+}
+
+# ----------------------------------------------------------------------------
+# Phase 2 — solar thermal defaults
+# ----------------------------------------------------------------------------
+SOLAR_THERMAL_EFFICIENCY = 0.50     # net collector efficiency
+SOLAR_THERMAL_LIFETIME   = 20       # years
+DHW_INTENSITY_KWH_M2 = {           # annual domestic hot water demand (kWh/m²/yr)
+    "office": 5, "hotel": 30, "hospital": 40,
+    "school": 8, "retail": 2,  "industrial": 5,
+}
+
+# ----------------------------------------------------------------------------
+# Phase 2 — fabric defaults
+# ----------------------------------------------------------------------------
+HDD_ANNUAL     = 2_400      # annual heating degree-days (UK average, base 15.5 °C)
+HEATING_EFF    = 0.90       # boiler/heat-pump system efficiency
+FABRIC_LIFETIME = 30        # years
+
+# EPC non-domestic asset rating bands (lower score = better)
+EPC_BANDS = [
+    ("A+", 0,  25),
+    ("A",  26, 50),
+    ("B",  51, 75),
+    ("C",  76, 100),
+    ("D",  101, 125),
+    ("E",  126, 150),
+    ("F",  151, 175),
+    ("G",  176, 999),
+]
 
 # ----------------------------------------------------------------------------
 # Climate (gentle maritime / temperate profile, deg C monthly means)

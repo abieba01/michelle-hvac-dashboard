@@ -5,3 +5,6 @@ matplotlib>=3.7
 streamlit>=1.35
 openpyxl>=3.1
 reportlab>=4.0
+requests>=2.31
+numpy-financial>=1.0
+scipy>=1.11

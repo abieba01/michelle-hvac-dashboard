@@ -1,10 +1,13 @@
 """
-app.py  -  Streamlit dashboard for the HVAC Optimisation AI Model.
-Run with:  streamlit run app.py
+app.py  —  Energy Management Dashboard (Phase 2)
+=================================================
+Tabs: HVAC Control | LED Lighting | Solar Energy | Fabric | Summary
+Run: python -m streamlit run app.py
 """
 from __future__ import annotations
 
 import io
+import math
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -14,130 +17,119 @@ import streamlit as st
 
 import config as C
 import data_generator as dg
+import weather as wx
+from building_profiles import PROFILES, get_profile
 from energy_model import train, predict_annual_kwh
-from hvac_optimizer import SCENARIOS, PRETTY
+from hvac_optimizer import SCENARIOS, PRETTY, _npv
 from report import generate_pdf
+import lighting as lt
+import meter_regression as mr
+import epc_lookup as epc
+import solar_pv as spv
+import solar_thermal as sth
+import fabric as fab
 
-st.set_page_config(page_title="Michelle's Project – HVAC Optimisation Dashboard", layout="wide")
-
-PALETTE = ["#1f4e79", "#2e75b6", "#5b9bd5", "#9dc3e6", "#c55a11"]
-
-
-# ---------------------------------------------------------------------------
-# Synthetic data path – cached once for the lifetime of the server process
-# ---------------------------------------------------------------------------
-@st.cache_resource(
-    show_spinner="Generating synthetic data and training the surrogate model – first run only…"
+st.set_page_config(
+    page_title="Michelle's Project – Energy Management Dashboard",
+    layout="wide",
 )
-def _load_synthetic():
-    data     = dg.generate()
+
+PALETTE = ["#1f4e79", "#2e75b6", "#5b9bd5", "#9dc3e6", "#c55a11", "#70ad47", "#ffc000"]
+
+
+# ============================================================================
+# Financial helpers (Phase 2 upgrades)
+# ============================================================================
+def _irr_pct(
+    annual_saving: float,
+    capex_net: float,
+    lifetime: int,
+    degradation: float,
+    maintenance: float,
+    inflation: float,
+) -> float:
+    """IRR (%) using numpy-financial if available; NaN otherwise."""
+    try:
+        import numpy_financial as npf
+        flows = [-capex_net]
+        for y in range(1, lifetime + 1):
+            net = annual_saving * ((1 + inflation) * (1 - degradation)) ** y - maintenance
+            flows.append(max(net, 0))
+        val = npf.irr(flows)
+        return float(val) * 100 if (val is not None and not math.isnan(float(val))) else float("nan")
+    except ImportError:
+        return float("nan")
+
+
+def _npv_inflated(
+    annual_saving: float,
+    capex_net: float,
+    lifetime: int,
+    rate: float,
+    degradation: float,
+    maintenance: float,
+    inflation: float,
+) -> float:
+    """NPV with annual price inflation and equipment degradation."""
+    total = -capex_net
+    for y in range(1, lifetime + 1):
+        net_y = annual_saving * ((1 + inflation) * (1 - degradation)) ** y - maintenance
+        total += net_y / (1 + rate) ** y
+    return total
+
+
+# ============================================================================
+# Cached data loaders
+# ============================================================================
+@st.cache_data(show_spinner="Fetching weather data…", ttl=86_400)
+def _get_weather(location: str, sim_years: int):
+    try:
+        lat, lon, name = wx.geocode(location)
+        df = wx.fetch_weather(lat, lon, sim_years)
+        return df, name, None
+    except Exception as exc:
+        return None, location, str(exc)
+
+
+@st.cache_data(
+    show_spinner="Generating data and training surrogate model – first run only…"
+)
+def _load_synthetic(building_type: str, floor_area: int,
+                    location: str, sim_years: int,
+                    hvac_target_override: float | None = None):
+    weather_df, location_name, wx_error = (None, location, None)
+    if location.strip():
+        weather_df, location_name, wx_error = _get_weather(location.strip(), sim_years)
+
+    data = dg.generate(years=sim_years, weather_df=weather_df,
+                       profile_name=building_type, floor_area=floor_area)
+
+    # If a calibrated HVAC target comes from meter regression, rescale
+    if hvac_target_override and hvac_target_override > 0:
+        raw_annual = data["hvac_kwh"].sum() / sim_years
+        scale_adj  = hvac_target_override / raw_annual if raw_annual > 0 else 1.0
+        data["hvac_kwh"] *= scale_adj
+        data.attrs["scale"] *= scale_adj
+
     train_df = dg.make_training_data(data)
     model, metrics, _ = train(train_df)
-    return _run_scenarios(model, data, C.SIM_YEARS), metrics, data
-
-
-# ---------------------------------------------------------------------------
-# Uploaded data path – re-runs whenever the file content changes
-# ---------------------------------------------------------------------------
-def _parse_upload(file_bytes: bytes) -> tuple[pd.DataFrame, list[str]]:
-    """
-    Read uploaded CSV, derive time columns from timestamp, fill any missing
-    control-lever columns with defaults, and calibrate the physics scale factor
-    so the augmentation step stays aligned with the real kWh totals.
-    Returns (df, list_of_warning_strings).
-    """
-    df = pd.read_csv(io.BytesIO(file_bytes))
-    warnings: list[str] = []
-
-    # ── Time columns ──────────────────────────────────────────────────────
-    time_cols = {"hour", "dayofweek", "month", "is_workday"}
-    has_ts       = "timestamp" in df.columns
-    has_time_cols = time_cols.issubset(df.columns)
-    if not has_ts and not has_time_cols:
-        raise ValueError(
-            "CSV must contain a 'timestamp' column, "
-            "or all four of: hour, dayofweek, month, is_workday."
-        )
-    if has_ts:
-        ts = pd.to_datetime(df["timestamp"])
-        df["timestamp"] = ts
-        if "hour"        not in df.columns: df["hour"]       = ts.dt.hour
-        if "dayofweek"   not in df.columns: df["dayofweek"]  = ts.dt.dayofweek
-        if "month"       not in df.columns: df["month"]       = ts.dt.month
-        if "is_workday"  not in df.columns:
-            df["is_workday"] = ts.dt.dayofweek.isin({0, 1, 2, 3, 4}).astype(int)
-        ts_idx = pd.DatetimeIndex(ts)
-    else:
-        ts_idx = None
-
-    # ── Energy target ─────────────────────────────────────────────────────
-    if "hvac_kwh" not in df.columns:
-        raise ValueError(
-            "CSV must contain a 'hvac_kwh' column "
-            "(hourly HVAC electricity consumption in kWh)."
-        )
-
-    # ── Optional columns – fill with defaults ─────────────────────────────
-    if "t_out" not in df.columns:
-        df["t_out"] = 10.0
-        warnings.append(
-            "'t_out' (outdoor temperature) not found – defaulted to 10 °C. "
-            "Model accuracy will be reduced."
-        )
-
-    if "solar" not in df.columns:
-        df["solar"] = (
-            dg._solar_gain(ts_idx) if ts_idx is not None else 0.3
-        )
-
-    if "occ_frac" not in df.columns:
-        df["occ_frac"] = np.where(
-            (df["hour"].between(8, 17)) & (df["is_workday"] == 1), 0.7, 0.05
-        )
-        warnings.append(
-            "'occ_frac' (occupancy fraction) not found – "
-            "using a basic 08:00–18:00 weekday schedule."
-        )
-
-    if "system_on" not in df.columns:
-        df["system_on"] = np.where(
-            (df["hour"].between(6, 18)) & (df["is_workday"] == 1), 1.0, 0.0
-        )
-
-    for col, default in [
-        ("cool_set",   C.COOLING_SETPOINT),
-        ("heat_set",   C.HEATING_SETPOINT),
-        ("deadband",   C.DEADBAND),
-        ("fan_factor", 1.0),
-        ("vent_frac",  1.0),
-    ]:
-        if col not in df.columns:
-            df[col] = default
-
-    # ── Calibrate scale so augmented physics aligns with real totals ──────
-    raw = dg.hvac_energy_kw(
-        df.t_out, df.solar, df.occ_frac, df.system_on,
-        df.cool_set, df.heat_set, df.deadband, df.fan_factor, df.vent_frac,
-    )
-    raw_total  = float(raw.sum())
-    real_total = float(df["hvac_kwh"].sum())
-    df.attrs["scale"] = (real_total / raw_total) if raw_total > 0 else 1.0
-
-    return df, warnings
+    energy = _run_scenarios(model, data, sim_years)
+    return energy, metrics, data, location_name, wx_error, weather_df
 
 
 @st.cache_data(show_spinner="Parsing upload and training model on your data…")
-def _load_uploaded(file_bytes: bytes):
-    df, warnings = _parse_upload(file_bytes)
+def _load_uploaded(file_bytes: bytes, building_type: str, floor_area: int):
+    df, warnings = _parse_upload(file_bytes, building_type, floor_area)
     sim_years    = max(1, round(len(df) / 8760))
     train_df     = dg.make_training_data(df)
     model, metrics, _ = train(train_df)
-    return _run_scenarios(model, df, sim_years), metrics, df, warnings
+    energy = _run_scenarios(model, df, sim_years)
+    return energy, metrics, df, warnings, None
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # Shared helpers
-# ---------------------------------------------------------------------------
+# ============================================================================
 def _run_scenarios(model, df: pd.DataFrame, sim_years: int) -> dict:
     baseline_kwh = predict_annual_kwh(model, SCENARIOS["baseline"](df), sim_years)
     energy = {}
@@ -153,214 +145,350 @@ def _run_scenarios(model, df: pd.DataFrame, sim_years: int) -> dict:
     return energy
 
 
+def _parse_upload(file_bytes: bytes, building_type: str, floor_area: int):
+    df = pd.read_csv(io.BytesIO(file_bytes))
+    warnings: list[str] = []
+    time_cols = {"hour", "dayofweek", "month", "is_workday"}
+    has_ts        = "timestamp" in df.columns
+    has_time_cols = time_cols.issubset(df.columns)
+    if not has_ts and not has_time_cols:
+        raise ValueError(
+            "CSV must contain a 'timestamp' column, "
+            "or all four of: hour, dayofweek, month, is_workday."
+        )
+    if has_ts:
+        ts = pd.to_datetime(df["timestamp"])
+        df["timestamp"] = ts
+        if "hour"       not in df.columns: df["hour"]      = ts.dt.hour
+        if "dayofweek"  not in df.columns: df["dayofweek"] = ts.dt.dayofweek
+        if "month"      not in df.columns: df["month"]     = ts.dt.month
+        if "is_workday" not in df.columns:
+            df["is_workday"] = ts.dt.dayofweek.isin({0,1,2,3,4}).astype(int)
+        ts_idx = pd.DatetimeIndex(ts)
+    else:
+        ts_idx = None
+    if "hvac_kwh" not in df.columns:
+        raise ValueError("CSV must contain a 'hvac_kwh' column.")
+    if "t_out"   not in df.columns: df["t_out"]  = 10.0
+    if "solar"   not in df.columns:
+        df["solar"] = dg._solar_gain(ts_idx) if ts_idx is not None else 0.3
+    if "occ_frac" not in df.columns:
+        df["occ_frac"] = np.where(
+            (df["hour"].between(8, 17)) & (df["is_workday"] == 1), 0.7, 0.05
+        )
+        warnings.append("'occ_frac' not found – using default 08:00–18:00 schedule.")
+    if "system_on" not in df.columns:
+        df["system_on"] = np.where(
+            (df["hour"].between(6, 18)) & (df["is_workday"] == 1), 1.0, 0.0
+        )
+    for col, default in [
+        ("cool_set", C.COOLING_SETPOINT), ("heat_set", C.HEATING_SETPOINT),
+        ("deadband", C.DEADBAND), ("fan_factor", 1.0), ("vent_frac", 1.0),
+    ]:
+        if col not in df.columns: df[col] = default
+    raw   = dg.hvac_energy_kw(df.t_out, df.solar, df.occ_frac, df.system_on,
+                               df.cool_set, df.heat_set, df.deadband,
+                               df.fan_factor, df.vent_frac)
+    raw_t = float(raw.sum()); real_t = float(df["hvac_kwh"].sum())
+    df.attrs["scale"]      = (real_t / raw_t) if raw_t > 0 else 1.0
+    df.attrs["floor_area"] = floor_area
+    df.attrs["profile"]    = building_type
+    return df, warnings
+
+
 @st.cache_data(show_spinner=False)
 def _sample_xlsx_bytes() -> bytes:
-    """Return a two-sheet Excel workbook: 48 rows of sample data + a README sheet."""
-    data = dg.generate(years=1)
+    data   = dg.generate(years=1)
     sample = data.head(48)[
         ["timestamp", "t_out", "solar", "occ_frac", "system_on",
          "cool_set", "heat_set", "deadband", "fan_factor", "vent_frac", "hvac_kwh"]
     ].copy()
     sample["timestamp"] = sample["timestamp"].astype(str)
-
-    readme = pd.DataFrame(
-        [
-            ("timestamp",  "Yes *",  "datetime",
-             "Date and time of the reading, one row per hour. "
-             "Format: YYYY-MM-DD HH:MM:SS. "
-             "* If omitted, the four columns hour / dayofweek / month / is_workday must all be present instead.",
-             "—"),
-            ("hvac_kwh",   "Yes",    "kWh",
-             "Hourly HVAC electricity consumption. "
-             "This is the value the model learns to predict. "
-             "Obtain from a dedicated sub-meter or smart meter.",
-             "—"),
-            ("t_out",      "No",     "°C",
-             "Outdoor dry-bulb temperature. "
-             "From a weather station, BMS sensor, or a free weather API. "
-             "Including this column significantly improves model accuracy.",
-             "10 °C (constant) — accuracy will be reduced"),
-            ("solar",      "No",     "0 – 1",
-             "Normalised solar gain. "
-             "0 = no sun (night or fully overcast), 1 = peak midsummer midday. "
-             "If omitted and a timestamp column is present, the app estimates it "
-             "from the hour of day and day of year.",
-             "Estimated from timestamp; 0.3 constant if no timestamp"),
-            ("occ_frac",   "No",     "0 – 1",
-             "Fraction of peak design occupancy present in the building. "
-             "Sources: people-counter system, CO₂-sensor inference, door-access logs. "
-             "Including this column significantly improves model accuracy.",
-             "0.7 during 08:00–18:00 on weekdays, 0.05 otherwise"),
-            ("system_on",  "No",     "0 or 1",
-             "Whether the HVAC plant is running: 1 = on, 0 = off. "
-             "From the BMS plant on/off status point.",
-             "1 during 06:00–18:00 on weekdays, 0 otherwise"),
-            ("cool_set",   "No",     "°C",
-             "Active cooling setpoint. "
-             "From the BMS or zone thermostat controller.",
-             f"{C.COOLING_SETPOINT}"),
-            ("heat_set",   "No",     "°C",
-             "Active heating setpoint. "
-             "From the BMS or zone thermostat controller.",
-             f"{C.HEATING_SETPOINT}"),
-            ("deadband",   "No",     "°C",
-             "Thermostat dead-band — the temperature margin either side of the setpoint "
-             "before heating or cooling activates. "
-             "From the BMS controller configuration.",
-             f"{C.DEADBAND}"),
-            ("fan_factor",  "No",    "0 – 1",
-             "AHU supply-fan speed as a fraction of full speed. "
-             "From the variable-speed drive (VSD) output signal. "
-             "Use 1.0 if the fan runs at a single fixed speed.",
-             "1.0 (full speed)"),
-            ("vent_frac",  "No",     "0 – 1",
-             "Ventilation rate as a fraction of the design (maximum) rate. "
-             "From the AHU damper position or CO₂-controlled DCV controller. "
-             "Use 1.0 if ventilation is not demand-controlled.",
-             "1.0 (full design rate)"),
-        ],
-        columns=["Column", "Required", "Unit", "Description", "Default if missing"],
-    )
-
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         sample.to_excel(writer, sheet_name="Sample data", index=False)
-        readme.to_excel(writer, sheet_name="README", index=False)
     return buf.getvalue()
 
 
-def _compute_results(energy, elec_price, carbon_factor, discount_rate, lifetime, capex_map):
+def _compute_results(energy, elec_price, carbon_factor, discount_rate, lifetime,
+                     capex_map, degradation_rate, maintenance_map,
+                     inflation_rate=0.0, grant_pct=0.0):
     rows = []
     for key, e in energy.items():
-        saved  = e["saved_kwh"]
-        cost   = saved * elec_price
-        carbon = saved * carbon_factor / 1000
-        capex  = capex_map.get(key, 0)
-        payback = capex / cost if (capex > 0 and cost > 0) else np.nan
-        npv = (
-            sum(cost / (1 + discount_rate) ** y for y in range(1, lifetime + 1)) - capex
-        ) if capex > 0 else np.nan
+        saved       = e["saved_kwh"]
+        cost        = saved * elec_price
+        carbon      = saved * carbon_factor / 1000
+        capex       = capex_map.get(key, 0)
+        capex_net   = capex * (1 - grant_pct / 100)
+        maintenance = maintenance_map.get(key, 0)
+        payback = capex_net / cost if (capex_net > 0 and cost > 0) else np.nan
+        npv     = _npv_inflated(cost, capex_net, lifetime, discount_rate,
+                                degradation_rate, maintenance, inflation_rate) \
+                  if capex > 0 else np.nan
+        irr     = _irr_pct(cost, capex_net, lifetime,
+                            degradation_rate, maintenance, inflation_rate) \
+                  if capex > 0 else np.nan
         rows.append({
-            "key":                       key,
-            "Strategy":                  e["scenario"],
-            "Annual HVAC (kWh/yr)":      e["annual_kwh"],
-            "Saved (kWh/yr)":            saved,
-            "Saving (%)":                e["saving_pct"],
-            "Cost saving (GBP/yr)":      cost,
-            "Carbon saving (tCO2e/yr)":  carbon,
-            "CAPEX (GBP)":               capex,
-            "Payback (yrs)":             payback,
-            "NPV (GBP)":                 npv,
+            "key":                      key,
+            "Strategy":                 e["scenario"],
+            "Annual HVAC (kWh/yr)":     e["annual_kwh"],
+            "Saved (kWh/yr)":           saved,
+            "Saving (%)":               e["saving_pct"],
+            "Cost saving (GBP/yr)":     cost,
+            "Carbon saving (tCO2e/yr)": carbon,
+            "CAPEX (GBP)":              capex,
+            "Payback (yrs)":            payback,
+            "NPV (GBP)":                npv,
+            "IRR (%)":                  irr,
         })
     return pd.DataFrame(rows)
 
 
-# ---------------------------------------------------------------------------
-# Sidebar
-# ---------------------------------------------------------------------------
+# ============================================================================
+# SIDEBAR
+# ============================================================================
 with st.sidebar:
+    st.header("Building settings")
+
+    building_type = st.selectbox(
+        "Building type",
+        options=list(PROFILES.keys()),
+        format_func=lambda k: PROFILES[k]["label"],
+        index=0,
+    )
+    profile = get_profile(building_type)
+    st.caption(f"{profile['description']}")
+    if profile["is_247"]:
+        st.info("24/7 building — occupancy scheduling saving is minimal.", icon="ℹ️")
+
+    floor_area = st.slider("Floor area (m²)", 200, 100_000, C.FLOOR_AREA_M2, 200)
+
+    location = st.text_input(
+        "Location (UK postcode or city)", value="London",
+        placeholder="e.g. EC1A 1BB or Manchester",
+    )
+
+    with st.expander("EPC information"):
+        epc_band_input = st.selectbox(
+            "Current EPC band",
+            ["A+", "A", "B", "C", "D", "E", "F", "G"],
+            index=3,
+        )
+        epc_api_key = st.text_input("EPC API key (optional)", type="password",
+                                    help="Free from epc.opendatacommunities.org — "
+                                         "leave blank to use manual band above.")
+        epc_email   = st.text_input("EPC API email (optional)",
+                                    help="Email registered with the EPC portal.")
+
+    st.divider()
+
+    # ── Data source ─────────────────────────────────────────────────────────
     st.header("Data source")
     data_source = st.radio(
         "data_source",
-        ["Synthetic (built-in)", "Upload my own CSV"],
+        ["Synthetic (built-in)", "Upload my own CSV", "Monthly electricity bills"],
         label_visibility="collapsed",
     )
+    uploaded_file   = None
+    monthly_kwh_in  = None
 
     if data_source == "Upload my own CSV":
-        with st.expander("Column requirements"):
-            st.markdown(
-                "**Must be present**\n"
-                "- `hvac_kwh` – hourly HVAC energy (kWh)\n"
-                "- `timestamp` *or* the four columns `hour`, `dayofweek`, `month`, `is_workday`\n\n"
-                "**Auto-filled if missing** (model less accurate without them)\n"
-                "- `t_out` – outdoor temp (°C)\n"
-                "- `occ_frac` – occupancy 0–1\n\n"
-                "**Defaulted to fixed values if missing**\n"
-                "- `solar`, `system_on`, `cool_set`, `heat_set`, "
-                "`deadband`, `fan_factor`, `vent_frac`"
-            )
         uploaded_file = st.file_uploader("Upload hourly CSV", type="csv")
         st.download_button(
-            label="Download sample file (.xlsx)",
+            "Download sample file (.xlsx)",
             data=_sample_xlsx_bytes(),
             file_name="hvac_sample.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            help="Excel workbook with two sheets: 48 rows of sample data and a README explaining every column.",
         )
 
+    elif data_source == "Monthly electricity bills":
+        with st.expander("Enter 12 monthly totals (kWh)", expanded=True):
+            st.caption("Total site electricity — the regression separates HVAC from base load.")
+            month_names = ["Jan","Feb","Mar","Apr","May","Jun",
+                           "Jul","Aug","Sep","Oct","Nov","Dec"]
+            monthly_kwh_in = []
+            cols = st.columns(2)
+            for i, m in enumerate(month_names):
+                with cols[i % 2]:
+                    val = st.number_input(m, min_value=0, max_value=10_000_000,
+                                         value=0, step=1_000, key=f"bill_{i}")
+                    monthly_kwh_in.append(float(val))
+
     st.divider()
+
+    # ── Economic assumptions ─────────────────────────────────────────────────
     st.header("Economic assumptions")
-    elec_price    = st.slider("Electricity price (GBP/kWh)",  0.10, 0.60, C.ELECTRICITY_PRICE,        0.01)
-    carbon_factor = st.slider("Carbon factor (kgCO2e/kWh)",   0.05, 0.50, C.CARBON_FACTOR,            0.001)
-    discount_rate = st.slider("Discount rate (%)",              1,   15,   int(C.DISCOUNT_RATE * 100), 1) / 100
-    lifetime      = st.slider("Measure lifetime (years)",       5,   30,   C.MEASURE_LIFETIME_YEARS,   1)
+    elec_price    = st.slider("Electricity (GBP/kWh)",   0.10, 0.60, C.ELECTRICITY_PRICE,    0.01)
+    gas_price     = st.slider("Gas (GBP/kWh)",           0.02, 0.20, C.GAS_PRICE,            0.005)
+    carbon_factor = st.slider("Carbon factor (kgCO2e/kWh)", 0.05, 0.50, C.CARBON_FACTOR,     0.001)
+    discount_rate = st.slider("Discount rate (%)",        1,   15,   int(C.DISCOUNT_RATE*100), 1) / 100
+    lifetime      = st.slider("HVAC measure lifetime (yrs)", 5, 30, C.MEASURE_LIFETIME_YEARS,  1)
+    inflation_rate= st.slider("Energy price inflation (%/yr)", 0.0, 8.0,
+                               float(C.INFLATION_RATE * 100), 0.1) / 100
+    grant_pct     = st.slider("Grant / subsidy (%)",     0, 50, int(C.GRANT_PCT),  5)
 
     st.divider()
-    st.header("Capital costs (GBP)")
-    capex_occ   = st.slider("Occupancy scheduling",         10_000, 100_000, C.CAPEX["occupancy_scheduling"], 1_000)
-    capex_therm = st.slider("Smart thermostats",             5_000,  80_000, C.CAPEX["smart_thermostats"],    1_000)
-    capex_bas   = st.slider("Building Automation System",   50_000, 300_000, C.CAPEX["bas"],                  5_000)
-    capex_comb  = st.slider("Combined strategy",            50_000, 400_000, C.CAPEX["combined"],              5_000)
+
+    # ── Degradation & Maintenance ────────────────────────────────────────────
+    st.header("Degradation & maintenance")
+    degradation_rate = st.slider(
+        "Equipment degradation (%/yr)",
+        0.0, 3.0, float(C.DEGRADATION_RATE * 100), 0.1,
+    ) / 100
+    with st.expander("Annual maintenance costs (GBP/yr)"):
+        maint_occ   = st.number_input("Occupancy scheduling",       0, 50_000, C.MAINTENANCE_COSTS["occupancy_scheduling"], 500)
+        maint_therm = st.number_input("Smart thermostats",          0, 50_000, C.MAINTENANCE_COSTS["smart_thermostats"],    500)
+        maint_bas   = st.number_input("Building Automation System", 0, 50_000, C.MAINTENANCE_COSTS["bas"],                  500)
+        maint_comb  = st.number_input("Combined strategy",          0, 50_000, C.MAINTENANCE_COSTS["combined"],             500)
+
+    st.divider()
+
+    # ── HVAC Capital costs ───────────────────────────────────────────────────
+    st.header("HVAC capital costs (GBP)")
+    capex_occ   = st.slider("Occupancy scheduling",        10_000, 100_000, C.CAPEX["occupancy_scheduling"], 1_000)
+    capex_therm = st.slider("Smart thermostats",            5_000,  80_000, C.CAPEX["smart_thermostats"],    1_000)
+    capex_bas   = st.slider("Building Automation System",  50_000, 300_000, C.CAPEX["bas"],                  5_000)
+    capex_comb  = st.slider("Combined strategy",           50_000, 400_000, C.CAPEX["combined"],             5_000)
 
 
-# ---------------------------------------------------------------------------
-# Load data (one branch per data source)
-# ---------------------------------------------------------------------------
-st.title("Michelle's Project – HVAC Optimisation Dashboard")
+# ============================================================================
+# LOAD DATA
+# ============================================================================
+st.title("Michelle's Project – Energy Management Dashboard")
 
 upload_warnings: list[str] = []
+wx_warning: str | None = None
+weather_df_for_solar: pd.DataFrame | None = None
+regression_result: dict | None = None
+
+# Handle monthly bills regression
+hvac_target_override: float | None = None
+if data_source == "Monthly electricity bills" and monthly_kwh_in:
+    non_zero = [v for v in monthly_kwh_in if v > 0]
+    if len(non_zero) >= 6:
+        # Get monthly HDD/CDD from weather if available
+        wx_df, wx_name, wx_err = _get_weather(location.strip() or "London", C.SIM_YEARS) \
+            if location.strip() else (None, "London", None)
+        if wx_df is not None:
+            monthly_dd = mr.degree_days_from_weather(wx_df)
+            # Average across years if multi-year weather
+            dd_avg = monthly_dd.groupby("month")[["hdd", "cdd"]].mean()
+            hdds   = [dd_avg.loc[m, "hdd"] if m in dd_avg.index else 0 for m in range(1, 13)]
+            cdds   = [dd_avg.loc[m, "cdd"] if m in dd_avg.index else 0 for m in range(1, 13)]
+        else:
+            hdds, cdds = mr.degree_days_from_monthly_temps(C.MONTHLY_MEAN_TEMP)
+        try:
+            regression_result = mr.regress(non_zero, hdds[:len(non_zero)], cdds[:len(non_zero)])
+            hvac_target_override = regression_result.get("annual_hvac_kwh")
+        except Exception as e:
+            st.warning(f"Regression error: {e}")
 
 if data_source == "Upload my own CSV":
     if not uploaded_file:
-        st.info("Upload a CSV file in the sidebar to get started. "
-                "Expand 'Column requirements' above the uploader to see what's needed.")
+        st.info("Upload a CSV file in the sidebar to get started.")
         st.stop()
     try:
-        energy, metrics, raw_data, upload_warnings = _load_uploaded(uploaded_file.getvalue())
+        energy, metrics, raw_data, upload_warnings, weather_df_for_solar = _load_uploaded(
+            uploaded_file.getvalue(), building_type, floor_area
+        )
     except ValueError as exc:
         st.error(f"Could not read your file: {exc}")
         st.stop()
-    data_label = f"Uploaded: {uploaded_file.name}  ({len(raw_data):,} rows)"
-else:
-    energy, metrics, raw_data = _load_synthetic()
     data_label = (
-        f"Synthetic data  |  {C.SIM_YEARS} years  |  "
-        f"{C.FLOOR_AREA_M2:,} m²  |  "
-        f"baseline HVAC ~{C.TARGET_ANNUAL_HVAC_KWH:,.0f} kWh/yr"
+        f"Uploaded: {uploaded_file.name}  |  {len(raw_data):,} rows  |  "
+        f"{PROFILES[building_type]['label']}  |  {floor_area:,} m²"
+    )
+else:
+    sim_years = C.SIM_YEARS
+    energy, metrics, raw_data, location_name, wx_error, weather_df_for_solar = _load_synthetic(
+        building_type, floor_area, location, sim_years, hvac_target_override
+    )
+    if wx_error:
+        wx_warning = f"Weather fetch failed ({wx_error}) — using synthetic weather."
+        loc_str = "Synthetic weather"
+    else:
+        loc_str = location_name or location
+    target = C.HVAC_ENERGY_INTENSITY_KWH_M2 * floor_area * (
+        PROFILES[building_type].get("hvac_kwh_m2", 100) / 100
+    )
+    if hvac_target_override:
+        target = hvac_target_override
+    data_label = (
+        f"{PROFILES[building_type]['label']}  |  {floor_area:,} m²  |  "
+        f"{loc_str}  |  baseline HVAC ~{target:,.0f} kWh/yr"
     )
 
 for w in upload_warnings:
     st.warning(w)
+if wx_warning:
+    st.warning(wx_warning)
+if profile["is_247"]:
+    st.info(
+        f"**24/7 building ({profile['label']})** — occupancy scheduling saving is minimal. "
+        "BAS variable-speed drives and smart thermostats remain fully effective.",
+        icon="ℹ️",
+    )
 
 st.caption(f"{data_label}  |  Surrogate model R² = {metrics['r2']:.4f}")
 
-# ---------------------------------------------------------------------------
-# Financial results
-# ---------------------------------------------------------------------------
+# Prepare shared financial inputs
 capex_map = {
-    "occupancy_scheduling": capex_occ,
-    "smart_thermostats":    capex_therm,
-    "bas":                  capex_bas,
-    "combined":             capex_comb,
+    "occupancy_scheduling": capex_occ, "smart_thermostats": capex_therm,
+    "bas": capex_bas, "combined": capex_comb,
 }
-df     = _compute_results(energy, elec_price, carbon_factor, discount_rate, lifetime, capex_map)
-non_bl = df[df["key"] != "baseline"].copy()
+maintenance_map = {
+    "occupancy_scheduling": maint_occ, "smart_thermostats": maint_therm,
+    "bas": maint_bas, "combined": maint_comb,
+}
 
-best = non_bl.sort_values("Cost saving (GBP/yr)", ascending=False).iloc[0]
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Best annual cost saving", f"GBP {best['Cost saving (GBP/yr)']:,.0f}", best["Strategy"])
-c2.metric("Electricity price",        f"GBP {elec_price:.2f}/kWh")
-c3.metric("Discount rate",            f"{discount_rate * 100:.0f}%")
-c4.metric("Measure lifetime",         f"{lifetime} yrs")
+df_results = _compute_results(
+    energy, elec_price, carbon_factor, discount_rate, lifetime,
+    capex_map, degradation_rate, maintenance_map, inflation_rate, grant_pct
+)
+non_bl = df_results[df_results["key"] != "baseline"].copy()
+best   = non_bl.sort_values("Cost saving (GBP/yr)", ascending=False).iloc[0]
 
-st.divider()
+# Baseline HVAC kWh (for solar self-consumption calculations)
+baseline_hvac_kwh = energy["baseline"]["annual_kwh"]
+total_building_kwh = baseline_hvac_kwh / max(PROFILES[building_type].get("hvac_kwh_m2", 100) / 100 * 0.45, 0.1)
 
-st.subheader("Results by strategy")
-styled = (
-    df.drop(columns=["key"])
-    .style
-    .format(
-        {
+
+# ============================================================================
+# TABS
+# ============================================================================
+tab_hvac, tab_light, tab_solar, tab_fabric, tab_summary = st.tabs(
+    ["HVAC Control", "LED Lighting", "Solar Energy", "Fabric & Envelope", "Full Summary"]
+)
+
+
+# ============================================================================
+# TAB 1 — HVAC CONTROL
+# ============================================================================
+with tab_hvac:
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Best annual cost saving",  f"GBP {best['Cost saving (GBP/yr)']:,.0f}", best["Strategy"])
+    c2.metric("Building type",            profile["label"])
+    c3.metric("Floor area",               f"{floor_area:,} m²")
+    c4.metric("Electricity price",        f"GBP {elec_price:.2f}/kWh")
+    c5.metric("Degradation rate",         f"{degradation_rate * 100:.1f}%/yr")
+
+    # Monthly bills regression info
+    if regression_result:
+        st.info("📊 **Degree-day regression from your monthly bills**")
+        rc1, rc2, rc3, rc4 = st.columns(4)
+        rc1.metric("Total electricity (yr)", f"{regression_result['annual_total_kwh']:,.0f} kWh")
+        rc2.metric("Estimated HVAC", f"{regression_result['annual_hvac_kwh']:,.0f} kWh")
+        rc3.metric("HVAC share", f"{regression_result['hvac_share_pct']:.0f}%")
+        rc4.metric("Regression R²", f"{regression_result['r2']:.2f}")
+        if regression_result.get("warning"):
+            st.warning(regression_result["warning"])
+
+    st.divider()
+    st.subheader("Results by strategy")
+    styled = (
+        df_results.drop(columns=["key"])
+        .style
+        .format({
             "Annual HVAC (kWh/yr)":     "{:,.0f}",
             "Saved (kWh/yr)":           "{:,.0f}",
             "Saving (%)":               "{:.1f}",
@@ -369,98 +497,625 @@ styled = (
             "CAPEX (GBP)":              "{:,.0f}",
             "Payback (yrs)":            "{:.1f}",
             "NPV (GBP)":                "{:,.0f}",
-        },
-        na_rep="—",
+            "IRR (%)":                  "{:.1f}",
+        }, na_rep="—")
     )
-)
-st.dataframe(styled, use_container_width=True, hide_index=True)
+    st.dataframe(styled, use_container_width=True, hide_index=True)
 
-with st.expander("Download data"):
-    dl1, dl2, dl3 = st.columns(3)
-    dl1.download_button(
-        label=f"Hourly dataset ({len(raw_data):,} rows)",
-        data=raw_data.to_csv(index=False).encode(),
-        file_name="hvac_hourly_data.csv",
-        mime="text/csv",
-        help="Weather, occupancy, control levers and HVAC demand for every row in the dataset.",
-    )
-    dl2.download_button(
-        label="Scenario results table",
-        data=df.drop(columns=["key"]).to_csv(index=False).encode(),
-        file_name="hvac_scenario_results.csv",
-        mime="text/csv",
-        help="The five-row summary with current slider values applied.",
-    )
-    pdf_assumptions = {
-        "elec_price":    elec_price,
-        "carbon_factor": carbon_factor,
-        "discount_rate": discount_rate,
-        "lifetime":      lifetime,
-        "capex_occ":     capex_occ,
-        "capex_therm":   capex_therm,
-        "capex_bas":     capex_bas,
-        "capex_comb":    capex_comb,
-    }
-    dl3.download_button(
-        label="Full PDF report",
-        data=generate_pdf(df, pdf_assumptions, metrics, data_label),
-        file_name="hvac_optimisation_report.pdf",
-        mime="application/pdf",
-        help="Professional PDF with results table, charts, and recommendations based on current slider values.",
-    )
+    with st.expander("Download data"):
+        dl1, dl2, dl3 = st.columns(3)
+        dl1.download_button("Hourly dataset",
+            raw_data.to_csv(index=False).encode(), "hvac_hourly_data.csv", "text/csv")
+        dl2.download_button("Scenario results",
+            df_results.drop(columns=["key"]).to_csv(index=False).encode(),
+            "hvac_scenario_results.csv", "text/csv")
+        dl3.download_button("Full PDF report",
+            generate_pdf(df_results, {
+                "elec_price": elec_price, "carbon_factor": carbon_factor,
+                "discount_rate": discount_rate, "lifetime": lifetime,
+                "capex_occ": capex_occ, "capex_therm": capex_therm,
+                "capex_bas": capex_bas, "capex_comb": capex_comb,
+            }, metrics, data_label),
+            "hvac_optimisation_report.pdf", "application/pdf")
 
-st.divider()
-
-# ---------------------------------------------------------------------------
-# Charts
-# ---------------------------------------------------------------------------
-col1, col2 = st.columns(2)
-
-with col1:
-    st.subheader("Energy saving by strategy")
-    fig, ax = plt.subplots(figsize=(5, 3.8))
-    bars = ax.bar(range(len(non_bl)), non_bl["Saving (%)"], color=PALETTE[1:1 + len(non_bl)])
-    ax.set_ylabel("HVAC energy saving (%)")
-    ax.set_xticks(range(len(non_bl)))
-    ax.set_xticklabels([s.replace(" ", "\n") for s in non_bl["Strategy"]], fontsize=8)
-    for bar, val in zip(bars, non_bl["Saving (%)"]):
-        ax.text(bar.get_x() + bar.get_width() / 2, val + 0.3,
-                f"{val:.1f}%", ha="center", fontsize=9, fontweight="bold")
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    plt.tight_layout()
-    st.pyplot(fig, use_container_width=True)
-    plt.close(fig)
-
-with col2:
-    st.subheader("Simple payback period by strategy")
-    pb = non_bl.dropna(subset=["Payback (yrs)"])
-    if pb.empty:
-        st.info("No payback data to display.")
-    else:
-        fig2, ax2 = plt.subplots(figsize=(5, 3.8))
-        ax2.barh(pb["Strategy"], pb["Payback (yrs)"], color=PALETTE[2])
-        ax2.set_xlabel("Simple payback period (years)")
-        ax2.invert_yaxis()
-        for patch, val in zip(ax2.patches, pb["Payback (yrs)"]):
-            ax2.text(val + 0.05, patch.get_y() + patch.get_height() / 2,
-                     f"{val:.1f} yr", va="center", fontsize=9)
-        ax2.spines["top"].set_visible(False)
-        ax2.spines["right"].set_visible(False)
+    st.divider()
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("Energy saving by strategy")
+        fig, ax = plt.subplots(figsize=(5, 3.8))
+        bars = ax.bar(range(len(non_bl)), non_bl["Saving (%)"], color=PALETTE[1:1+len(non_bl)])
+        ax.set_ylabel("HVAC energy saving (%)")
+        ax.set_xticks(range(len(non_bl)))
+        ax.set_xticklabels([s.replace(" ", "\n") for s in non_bl["Strategy"]], fontsize=8)
+        for bar, val in zip(bars, non_bl["Saving (%)"]):
+            ax.text(bar.get_x() + bar.get_width()/2, val + 0.3,
+                    f"{val:.1f}%", ha="center", fontsize=9, fontweight="bold")
+        ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
         plt.tight_layout()
-        st.pyplot(fig2, use_container_width=True)
-        plt.close(fig2)
+        st.pyplot(fig, use_container_width=True); plt.close(fig)
 
-# ---------------------------------------------------------------------------
-# Model details footer
-# ---------------------------------------------------------------------------
-with st.expander("Surrogate model performance"):
-    m1, m2, m3 = st.columns(3)
-    m1.metric("R2",   f"{metrics['r2']:.4f}")
-    m2.metric("MAE",  f"{metrics['mae']:.2f} kWh/h")
-    m3.metric("RMSE", f"{metrics['rmse']:.2f} kWh/h")
-    st.caption(
-        f"Trained on {metrics['n_train']:,} rows, "
-        f"tested on {metrics['n_test']:,} rows. "
-        f"Mean target: {metrics['mean_target']:.2f} kWh/h."
+    with col2:
+        st.subheader("Simple payback period")
+        pb = non_bl.dropna(subset=["Payback (yrs)"])
+        if pb.empty:
+            st.info("No payback data to display.")
+        else:
+            fig2, ax2 = plt.subplots(figsize=(5, 3.8))
+            ax2.barh(pb["Strategy"], pb["Payback (yrs)"], color=PALETTE[2])
+            ax2.set_xlabel("Simple payback period (years)")
+            ax2.invert_yaxis()
+            for patch, val in zip(ax2.patches, pb["Payback (yrs)"]):
+                ax2.text(val + 0.05, patch.get_y() + patch.get_height()/2,
+                         f"{val:.1f} yr", va="center", fontsize=9)
+            ax2.spines["top"].set_visible(False); ax2.spines["right"].set_visible(False)
+            plt.tight_layout()
+            st.pyplot(fig2, use_container_width=True); plt.close(fig2)
+
+    with st.expander("Surrogate model performance"):
+        m1, m2, m3 = st.columns(3)
+        m1.metric("R²",   f"{metrics['r2']:.4f}")
+        m2.metric("MAE",  f"{metrics['mae']:.2f} kWh/h")
+        m3.metric("RMSE", f"{metrics['rmse']:.2f} kWh/h")
+        st.caption(
+            f"Building type: {profile['label']}  |  Floor area: {floor_area:,} m²  |  "
+            f"Trained on {metrics['n_train']:,} rows, tested on {metrics['n_test']:,} rows.  "
+            f"Mean target: {metrics['mean_target']:.2f} kWh/h."
+        )
+
+
+# ============================================================================
+# TAB 2 — LED LIGHTING
+# ============================================================================
+with tab_light:
+    st.subheader("LED Lighting Upgrade Analysis")
+    st.markdown(
+        "Configure the existing lighting in your building to calculate the "
+        "saving from a full LED retrofit with optional controls."
+    )
+
+    # ── Inputs ──────────────────────────────────────────────────────────────
+    li_c1, li_c2 = st.columns([2, 1])
+    with li_c1:
+        light_hours = st.slider(
+            "Annual operating hours", 500, 8_760, C.LIGHTING_HOURS_PER_YEAR, 50,
+            help="Hours per year the lights are on. Typical office: 2,250 h/yr.",
+        )
+        light_lifetime = st.slider("LED system lifetime (years)", 5, 30, C.LIGHTING_LIFETIME_YEARS, 1)
+    with li_c2:
+        st.info(
+            f"**Operating hours guide**\n"
+            f"- Office (9–17h, 5 days): ~1,800 h/yr\n"
+            f"- Retail (7 days): ~4,200 h/yr\n"
+            f"- Hospital (24/7): ~8,760 h/yr"
+        )
+
+    st.markdown("---")
+    st.markdown("**Configure lighting zones** (up to 3 zones)")
+
+    zone_results = []
+    total_area_pct = 0.0
+
+    for z_idx in range(1, 4):
+        with st.expander(f"Zone {z_idx}" + (" (required)" if z_idx == 1 else " (optional)"),
+                         expanded=(z_idx == 1)):
+            enable_zone = True if z_idx == 1 else st.checkbox(f"Enable zone {z_idx}", key=f"en_{z_idx}")
+            if enable_zone:
+                zc1, zc2, zc3, zc4 = st.columns(4)
+                with zc1:
+                    fitting  = st.selectbox(
+                        "Fitting type",
+                        options=list(lt.FITTINGS.keys()),
+                        format_func=lambda k: lt.FITTINGS[k]["label"],
+                        key=f"fit_{z_idx}",
+                    )
+                with zc2:
+                    area_pct = st.slider(
+                        "Area covered (%)", 5, 100,
+                        100 if z_idx == 1 else 30,
+                        5, key=f"apct_{z_idx}",
+                    )
+                with zc3:
+                    control  = st.selectbox(
+                        "Control upgrade",
+                        options=list(lt.CONTROLS.keys()),
+                        format_func=lambda k: lt.CONTROLS[k]["label"],
+                        key=f"ctrl_{z_idx}",
+                    )
+                with zc4:
+                    capex_ov = st.number_input(
+                        "CAPEX override (GBP, 0 = auto)",
+                        min_value=0, max_value=5_000_000, value=0, step=1_000,
+                        key=f"capx_{z_idx}",
+                        help="Leave 0 to use the standard installed cost rate."
+                    )
+
+                r = lt.calculate(
+                    floor_area    = floor_area,
+                    fitting_type  = fitting,
+                    control_type  = control,
+                    area_fraction = area_pct / 100,
+                    operating_hours = light_hours,
+                    elec_price    = elec_price,
+                    capex_override= capex_ov if capex_ov > 0 else None,
+                )
+                r["zone"] = f"Zone {z_idx}"
+                zone_results.append(r)
+                total_area_pct += area_pct
+
+    if zone_results:
+        # ── Results ─────────────────────────────────────────────────────────
+        st.divider()
+        st.subheader("Lighting results")
+        totals = lt.total_saving(zone_results)
+
+        km1, km2, km3, km4 = st.columns(4)
+        km1.metric("Total energy saving", f"{totals['total_saving_kwh']:,.0f} kWh/yr",
+                   f"{totals['total_saving_pct']:.0f}% reduction")
+        km2.metric("Annual cost saving",  f"GBP {totals['total_cost_saving']:,.0f}")
+        km3.metric("Total CAPEX",         f"GBP {totals['total_capex']:,.0f}")
+        km4.metric("Simple payback",
+                   f"{totals['payback_years']:.1f} yrs" if not math.isnan(totals['payback_years']) else "—")
+
+        # NPV for lighting
+        capex_net_light = totals["total_capex"] * (1 - grant_pct / 100)
+        npv_light = _npv_inflated(
+            totals["total_cost_saving"], capex_net_light,
+            light_lifetime, discount_rate, 0.01, 0, inflation_rate
+        )
+        irr_light = _irr_pct(
+            totals["total_cost_saving"], capex_net_light,
+            light_lifetime, 0.01, 0, inflation_rate
+        )
+
+        nk1, nk2, nk3 = st.columns(3)
+        nk1.metric(f"NPV ({light_lifetime} yr)", f"GBP {npv_light:,.0f}")
+        nk2.metric("IRR", f"{irr_light:.1f}%" if not math.isnan(irr_light) else "—")
+        nk3.metric("Carbon saving",
+                   f"{totals['total_saving_kwh'] * C.CARBON_FACTOR / 1000:.1f} tCO2e/yr")
+
+        # Zone breakdown table
+        light_table = pd.DataFrame([{
+            "Zone":              r["zone"],
+            "Fitting type":      r["fitting_label"],
+            "Controls":          r["control_label"],
+            "Lit area (m²)":     r["lit_area_m2"],
+            "Baseline (kWh/yr)": r["baseline_kwh"],
+            "After LED (kWh/yr)":r["led_kwh"],
+            "Saving (kWh/yr)":   r["saving_kwh"],
+            "Saving (%)":        r["saving_pct"],
+            "Cost saving (GBP/yr)": r["cost_saving_gbp"],
+            "CAPEX (GBP)":       r["capex_gbp"],
+            "Payback (yrs)":     r["payback_years"],
+        } for r in zone_results])
+        st.dataframe(
+            light_table.style.format({
+                "Lit area (m²)": "{:,.0f}", "Baseline (kWh/yr)": "{:,.0f}",
+                "After LED (kWh/yr)": "{:,.0f}", "Saving (kWh/yr)": "{:,.0f}",
+                "Saving (%)": "{:.1f}", "Cost saving (GBP/yr)": "{:,.0f}",
+                "CAPEX (GBP)": "{:,.0f}", "Payback (yrs)": "{:.1f}",
+            }, na_rep="—"),
+            use_container_width=True, hide_index=True
+        )
+
+        # Bar chart
+        fig, ax = plt.subplots(figsize=(7, 3.5))
+        categories = [r["zone"] for r in zone_results]
+        baseline_vals = [r["baseline_kwh"] for r in zone_results]
+        led_vals      = [r["led_kwh"]      for r in zone_results]
+        x = np.arange(len(categories))
+        w = 0.35
+        ax.bar(x - w/2, baseline_vals, w, label="Before LED", color=PALETTE[4])
+        ax.bar(x + w/2, led_vals,      w, label="After LED",  color=PALETTE[2])
+        ax.set_ylabel("Annual energy (kWh/yr)")
+        ax.set_xticks(x); ax.set_xticklabels(categories)
+        ax.legend(); ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
+        plt.tight_layout()
+        st.pyplot(fig, use_container_width=True); plt.close(fig)
+
+
+# ============================================================================
+# TAB 3 — SOLAR ENERGY
+# ============================================================================
+with tab_solar:
+    st.subheader("Solar Energy Analysis")
+    sol_tab_pv, sol_tab_shw = st.tabs(["Solar Photovoltaic (PV)", "Solar Hot Water"])
+
+    # ── SOLAR PV ─────────────────────────────────────────────────────────────
+    with sol_tab_pv:
+        st.markdown("Estimate annual PV generation, self-consumption, and export income.")
+        pv_c1, pv_c2, pv_c3 = st.columns(3)
+        with pv_c1:
+            pv_capacity   = st.number_input("System capacity (kWp)", 1.0, 5000.0, 100.0, 10.0)
+            pv_orientation= st.selectbox("Orientation",
+                list(spv.ORIENTATION_FACTORS.keys()), index=0)
+            pv_tilt       = st.select_slider("Tilt angle (°)", [0,10,15,20,30,35,40,45,50], value=30)
+        with pv_c2:
+            pv_export_tariff = st.slider("SEG export tariff (GBP/kWh)",
+                                         0.04, 0.30, C.SOLAR_PV_EXPORT_TARIFF, 0.01)
+            pv_capex_kwp  = st.slider("CAPEX (GBP/kWp)", 800, 2_000, 1_200, 50)
+            pv_lifetime   = st.slider("System lifetime (years)", 10, 30, C.SOLAR_PV_LIFETIME, 1)
+        with pv_c3:
+            st.info(
+                "**Typical UK PV outputs**\n"
+                "- 100 kWp south 30°: ~90,000 kWh/yr\n"
+                "- 250 kWp south 30°: ~225,000 kWh/yr\n"
+                "- Performance ratio default: 80%"
+            )
+
+        if st.button("Calculate solar PV", type="primary", key="calc_pv"):
+            pv_r = spv.financials(
+                capacity_kwp          = pv_capacity,
+                orientation           = pv_orientation,
+                tilt_deg              = pv_tilt,
+                building_type         = building_type,
+                building_annual_load_kwh = baseline_hvac_kwh,
+                elec_price            = elec_price,
+                export_tariff         = pv_export_tariff,
+                discount_rate         = discount_rate,
+                inflation_rate        = inflation_rate,
+                grant_pct             = float(grant_pct),
+                weather_df            = weather_df_for_solar,
+                lifetime_years        = pv_lifetime,
+                capex_per_kwp         = float(pv_capex_kwp),
+            )
+            st.session_state["pv_result"] = pv_r
+
+        if "pv_result" in st.session_state:
+            pv_r = st.session_state["pv_result"]
+            st.divider()
+            pv_m1, pv_m2, pv_m3, pv_m4 = st.columns(4)
+            pv_m1.metric("Annual generation",  f"{pv_r['annual_gen_kwh']:,.0f} kWh")
+            pv_m2.metric("Self-consumed",       f"{pv_r['self_consumed_kwh']:,.0f} kWh")
+            pv_m3.metric("Exported",            f"{pv_r['exported_kwh']:,.0f} kWh")
+            pv_m4.metric("Annual income",       f"GBP {pv_r['total_annual_income_gbp']:,.0f}")
+
+            pv_m5, pv_m6, pv_m7, pv_m8 = st.columns(4)
+            pv_m5.metric("Total CAPEX",         f"GBP {pv_r['total_capex_gbp']:,.0f}")
+            pv_m6.metric("Payback",
+                         f"{pv_r['payback_years']:.1f} yrs" if not math.isnan(pv_r['payback_years']) else "—")
+            pv_m7.metric(f"NPV ({pv_lifetime} yr)", f"GBP {pv_r['npv_gbp']:,.0f}")
+            pv_m8.metric("IRR",
+                         f"{pv_r['irr_pct']:.1f}%" if not math.isnan(pv_r['irr_pct']) else "—")
+
+            st.metric("Carbon avoided", f"{pv_r['carbon_saved_tco2e']:.1f} tCO2e/yr")
+
+            # Income breakdown donut
+            fig, ax = plt.subplots(figsize=(4, 3))
+            vals   = [pv_r["import_saved_gbp"], pv_r["export_income_gbp"]]
+            labels = [f"Import saving\nGBP {vals[0]:,.0f}",
+                      f"Export income\nGBP {vals[1]:,.0f}"]
+            ax.pie(vals, labels=labels, colors=[PALETTE[1], PALETTE[5]],
+                   autopct="%1.0f%%", startangle=90)
+            ax.set_title("Annual income breakdown")
+            plt.tight_layout()
+            st.pyplot(fig, use_container_width=True); plt.close(fig)
+
+    # ── SOLAR HOT WATER ───────────────────────────────────────────────────────
+    with sol_tab_shw:
+        st.markdown("Estimate solar thermal yield and displacement of gas or electricity for DHW.")
+        shw_c1, shw_c2 = st.columns(2)
+        with shw_c1:
+            shw_area       = st.number_input("Collector area (m²)", 1.0, 2000.0, 50.0, 5.0)
+            shw_orientation= st.selectbox("Orientation",
+                list(sth.ORIENTATION_FACTORS.keys()), index=0, key="shw_ori")
+            shw_fuel       = st.selectbox("Existing fuel for hot water",
+                ["gas", "electricity"], format_func=str.capitalize)
+            shw_capex_m2   = st.slider("CAPEX (GBP/m² collector)", 300, 1_000, 650, 25)
+            shw_lifetime   = st.slider("System lifetime (years)", 10, 25, C.SOLAR_THERMAL_LIFETIME, 1)
+        with shw_c2:
+            dhw_intensity = C.DHW_INTENSITY_KWH_M2.get(building_type, 5)
+            dhw_demand    = dhw_intensity * floor_area
+            st.info(
+                f"**Building DHW demand**\n\n"
+                f"- Intensity ({profile['label']}): **{dhw_intensity} kWh/m²/yr**\n"
+                f"- Total demand: **{dhw_demand:,.0f} kWh/yr**\n\n"
+                f"Practical solar fraction maximum: **70%**"
+            )
+
+        if st.button("Calculate solar hot water", type="primary", key="calc_shw"):
+            shw_r = sth.financials(
+                collector_area_m2 = shw_area,
+                floor_area        = floor_area,
+                building_type     = building_type,
+                orientation       = shw_orientation,
+                fuel_type         = shw_fuel,
+                elec_price        = elec_price,
+                gas_price         = gas_price,
+                discount_rate     = discount_rate,
+                inflation_rate    = inflation_rate,
+                grant_pct         = float(grant_pct),
+                weather_df        = weather_df_for_solar,
+                lifetime_years    = shw_lifetime,
+                capex_per_m2      = float(shw_capex_m2),
+            )
+            st.session_state["shw_result"] = shw_r
+
+        if "shw_result" in st.session_state:
+            shw_r = st.session_state["shw_result"]
+            st.divider()
+            sm1, sm2, sm3, sm4 = st.columns(4)
+            sm1.metric("Annual solar yield",  f"{shw_r['net_yield_kwh']:,.0f} kWh")
+            sm2.metric("Solar fraction",      f"{shw_r['solar_fraction_pct']:.0f}%")
+            sm3.metric("Annual cost saving",  f"GBP {shw_r['cost_saving_gbp']:,.0f}")
+            sm4.metric("Carbon saving",       f"{shw_r['carbon_saved_tco2e']:.1f} tCO2e/yr")
+
+            sm5, sm6, sm7 = st.columns(3)
+            sm5.metric("Total CAPEX",  f"GBP {shw_r['total_capex_gbp']:,.0f}")
+            sm6.metric("Payback",
+                       f"{shw_r['payback_years']:.1f} yrs" if not math.isnan(shw_r['payback_years']) else "—")
+            sm7.metric(f"NPV ({shw_lifetime} yr)", f"GBP {shw_r['npv_gbp']:,.0f}")
+
+
+# ============================================================================
+# TAB 4 — FABRIC & ENVELOPE
+# ============================================================================
+with tab_fabric:
+    st.subheader("Fabric & Envelope Improvement Analysis")
+
+    fb_c1, fb_c2 = st.columns([2, 1])
+    with fb_c2:
+        fab_fuel     = st.selectbox("Existing heating fuel",
+                                    ["gas", "electricity"], format_func=str.capitalize)
+        fab_hdd      = st.slider("Annual heating degree-days", 500, 4_000, C.HDD_ANNUAL, 50,
+                                 help="Base 15.5°C. UK typical: 2,000–2,800.")
+        fab_lifetime = st.slider("Measure lifetime (years)", 15, 50, C.FABRIC_LIFETIME, 1)
+
+    with fb_c1:
+        st.markdown("**Select elements to improve and enter areas:**")
+        with st.expander("Pre-set retrofit packages", expanded=False):
+            pkg = st.radio("Apply a package", ["None"] + list(fab.PACKAGES.keys()),
+                           format_func=lambda k: fab.PACKAGES[k]["label"] if k != "None" else "None",
+                           horizontal=True)
+            if pkg != "None":
+                st.caption(fab.PACKAGES[pkg]["description"])
+
+    # Element configuration
+    package_elements = fab.PACKAGES.get(pkg if pkg != "None" else "", {}).get("elements", [])
+    element_data = []
+    for key, defn in fab.ELEMENTS.items():
+        is_in_package = key in package_elements
+        with st.expander(
+            f"{'✅ ' if is_in_package else ''}{defn['label']}",
+            expanded=is_in_package
+        ):
+            enable = st.checkbox("Include this element", value=is_in_package, key=f"fab_en_{key}")
+            if enable:
+                fc1, fc2, fc3 = st.columns(3)
+                with fc1:
+                    area = st.number_input("Area (m²)", 0.0, 50_000.0, 500.0, 50.0, key=f"fab_a_{key}")
+                with fc2:
+                    u_old = st.number_input("Current U-value (W/m²K)",
+                                            0.10, 8.0, float(defn["u_typical"]), 0.05,
+                                            key=f"fab_uo_{key}")
+                with fc3:
+                    u_new = st.number_input("Target U-value (W/m²K)",
+                                            0.05, 8.0, float(defn["u_target"]), 0.01,
+                                            key=f"fab_un_{key}")
+                st.caption(f"Typical CAPEX: £{defn['capex_m2']}/m²  |  {defn['description']}")
+                element_data.append({"key": key, "area_m2": area, "u_old": u_old, "u_new": u_new})
+
+    if element_data and st.button("Calculate fabric savings", type="primary", key="calc_fab"):
+        fab_r = fab.calculate(
+            elements       = element_data,
+            hdd_annual     = fab_hdd,
+            fuel_type      = fab_fuel,
+            elec_price     = elec_price,
+            gas_price      = gas_price,
+            discount_rate  = discount_rate,
+            inflation_rate = inflation_rate,
+            grant_pct      = float(grant_pct),
+            lifetime_years = fab_lifetime,
+        )
+        st.session_state["fab_result"] = fab_r
+
+    if "fab_result" in st.session_state:
+        fab_r = st.session_state["fab_result"]
+        st.divider()
+        st.subheader("Fabric results")
+        fm1, fm2, fm3, fm4 = st.columns(4)
+        fm1.metric("Total heating saving", f"{fab_r['total_saving_kwh']:,.0f} kWh/yr")
+        fm2.metric("Annual cost saving",   f"GBP {fab_r['total_cost_saving']:,.0f}")
+        fm3.metric("Total CAPEX",          f"GBP {fab_r['total_capex']:,.0f}")
+        fm4.metric("Payback",
+                   f"{fab_r['payback_years']:.1f} yrs" if not math.isnan(fab_r['payback_years']) else "—")
+
+        fm5, fm6 = st.columns(2)
+        fm5.metric(f"NPV ({fab_lifetime} yr)", f"GBP {fab_r['npv_gbp']:,.0f}")
+        fm6.metric("Carbon saving", f"{fab_r['total_carbon_tco2e']:.1f} tCO2e/yr")
+
+        fab_table = pd.DataFrame([{
+            "Element":          row["element"],
+            "Area (m²)":        row["area_m2"],
+            "U-old (W/m²K)":   row["u_old"],
+            "U-new (W/m²K)":   row["u_new"],
+            "Saving (kWh/yr)":  row["saving_kwh"],
+            "Cost saving (GBP/yr)": row["cost_saving_gbp"],
+            "CAPEX (GBP)":      row["capex_gbp"],
+            "Payback (yrs)":    row["payback_years"],
+        } for row in fab_r["element_rows"]])
+        st.dataframe(
+            fab_table.style.format({
+                "Area (m²)": "{:,.0f}", "U-old (W/m²K)": "{:.2f}",
+                "U-new (W/m²K)": "{:.2f}", "Saving (kWh/yr)": "{:,.0f}",
+                "Cost saving (GBP/yr)": "{:,.0f}", "CAPEX (GBP)": "{:,.0f}",
+                "Payback (yrs)": "{:.1f}",
+            }, na_rep="—"),
+            use_container_width=True, hide_index=True
+        )
+
+        # Bar chart by element
+        if fab_r["element_rows"]:
+            fig, ax = plt.subplots(figsize=(8, 3.5))
+            el_labels = [r["element"].split("—")[0].strip() for r in fab_r["element_rows"]]
+            el_save   = [r["saving_kwh"] for r in fab_r["element_rows"]]
+            ax.barh(el_labels, el_save, color=PALETTE[1])
+            ax.set_xlabel("Annual heating saving (kWh/yr)")
+            ax.invert_yaxis()
+            ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
+            plt.tight_layout()
+            st.pyplot(fig, use_container_width=True); plt.close(fig)
+
+
+# ============================================================================
+# TAB 5 — FULL SUMMARY
+# ============================================================================
+with tab_summary:
+    st.subheader("Full Energy Management Summary")
+    st.markdown("Combined view of all modelled improvements.")
+
+    # Gather available results
+    hvac_saving_kwh  = float(best["Saved (kWh/yr)"])
+    hvac_cost        = float(best["Cost saving (GBP/yr)"])
+    hvac_capex       = float(best["CAPEX (GBP)"])
+    hvac_carbon      = float(best["Carbon saving (tCO2e/yr)"])
+
+    light_saving_kwh = 0.0; light_cost = 0.0; light_capex = 0.0; light_carbon = 0.0
+    if zone_results:
+        totals_l     = lt.total_saving(zone_results)
+        light_saving_kwh = totals_l["total_saving_kwh"]
+        light_cost       = totals_l["total_cost_saving"]
+        light_capex      = totals_l["total_capex"]
+        light_carbon     = light_saving_kwh * C.CARBON_FACTOR / 1000
+
+    pv_saving_kwh = 0.0; pv_cost = 0.0; pv_capex = 0.0; pv_carbon = 0.0
+    if "pv_result" in st.session_state:
+        pv_r = st.session_state["pv_result"]
+        pv_saving_kwh = pv_r["self_consumed_kwh"]
+        pv_cost       = pv_r["total_annual_income_gbp"]
+        pv_capex      = pv_r["total_capex_gbp"]
+        pv_carbon     = pv_r["carbon_saved_tco2e"]
+
+    shw_saving_kwh = 0.0; shw_cost = 0.0; shw_capex = 0.0; shw_carbon = 0.0
+    if "shw_result" in st.session_state:
+        shw_r = st.session_state["shw_result"]
+        shw_saving_kwh = shw_r["fuel_saved_kwh"]
+        shw_cost       = shw_r["cost_saving_gbp"]
+        shw_capex      = shw_r["total_capex_gbp"]
+        shw_carbon     = shw_r["carbon_saved_tco2e"]
+
+    fab_saving_kwh = 0.0; fab_cost = 0.0; fab_capex = 0.0; fab_carbon = 0.0
+    if "fab_result" in st.session_state:
+        fab_r = st.session_state["fab_result"]
+        fab_saving_kwh = fab_r["total_saving_kwh"]
+        fab_cost       = fab_r["total_cost_saving"]
+        fab_capex      = fab_r["total_capex"]
+        fab_carbon     = fab_r["total_carbon_tco2e"]
+
+    total_saving_kwh = hvac_saving_kwh + light_saving_kwh + pv_saving_kwh + shw_saving_kwh + fab_saving_kwh
+    total_cost       = hvac_cost + light_cost + pv_cost + shw_cost + fab_cost
+    total_capex      = hvac_capex + light_capex + pv_capex + shw_capex + fab_capex
+    total_carbon     = hvac_carbon + light_carbon + pv_carbon + shw_carbon + fab_carbon
+    overall_payback  = total_capex / total_cost if total_cost > 0 else float("nan")
+
+    # KPI row
+    sk1, sk2, sk3, sk4, sk5 = st.columns(5)
+    sk1.metric("Total annual cost saving", f"GBP {total_cost:,.0f}")
+    sk2.metric("Total energy saving",      f"{total_saving_kwh:,.0f} kWh/yr")
+    sk3.metric("Total carbon saving",      f"{total_carbon:.1f} tCO2e/yr")
+    sk4.metric("Total CAPEX",              f"GBP {total_capex:,.0f}")
+    sk5.metric("Blended payback",
+               f"{overall_payback:.1f} yrs" if not math.isnan(overall_payback) else "—")
+
+    st.divider()
+
+    # EPC projection
+    with st.expander("EPC band projection", expanded=True):
+        current_score  = epc.band_to_midpoint(epc_band_input)
+        total_intensity= baseline_hvac_kwh / max(floor_area, 1)
+        epc_score_now  = epc.kwh_m2_to_score(total_intensity * (1 / 0.45), building_type)
+        saving_vs_total = (total_saving_kwh / max(baseline_hvac_kwh * (1/0.45), 1)) * 100
+        new_band, new_score = epc.project_new_band(
+            epc.band_to_midpoint(epc_band_input), saving_vs_total
+        )
+        ep1, ep2, ep3 = st.columns(3)
+        ep1.metric("Current EPC band (manual input)", epc_band_input)
+        ep2.metric("Estimated saving vs total energy", f"{saving_vs_total:.0f}%")
+        ep3.metric("Projected EPC band after improvements", new_band,
+                   delta=f"from {epc_band_input}")
+        if epc_api_key and epc_email and location:
+            with st.spinner("Checking EPC register…"):
+                try:
+                    records = epc.lookup_by_postcode(location.replace(" ", ""),
+                                                     epc_email, epc_api_key)
+                    if records:
+                        r0 = epc.parse_record(records[0])
+                        st.success(f"EPC found: **{r0['address']}** — Band **{r0['band']}** "
+                                   f"(score {r0['score']}, lodged {r0['lodgement_date']})")
+                    else:
+                        st.info("No EPC records found for this postcode in the register.")
+                except Exception as e:
+                    st.warning(f"EPC API lookup failed: {e}")
+
+    # Stacked bar chart — savings by category
+    categories  = ["HVAC control", "LED lighting", "Solar PV", "Solar thermal", "Fabric"]
+    cost_values = [hvac_cost, light_cost, pv_cost, shw_cost, fab_cost]
+    kwh_values  = [hvac_saving_kwh, light_saving_kwh, pv_saving_kwh, shw_saving_kwh, fab_saving_kwh]
+
+    active_cats  = [(c, cv, kv) for c, cv, kv in zip(categories, cost_values, kwh_values) if cv > 0]
+    if active_cats:
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+        cats = [a[0] for a in active_cats]
+        cvs  = [a[1] for a in active_cats]
+        kvs  = [a[2] for a in active_cats]
+
+        bars1 = axes[0].bar(cats, cvs, color=PALETTE[:len(cats)])
+        axes[0].set_ylabel("Annual cost saving (GBP/yr)")
+        axes[0].set_title("Cost saving by technology")
+        for bar, v in zip(bars1, cvs):
+            axes[0].text(bar.get_x() + bar.get_width()/2, v + 50,
+                         f"£{v:,.0f}", ha="center", fontsize=8, fontweight="bold")
+        axes[0].tick_params(axis="x", rotation=20)
+        axes[0].spines["top"].set_visible(False); axes[0].spines["right"].set_visible(False)
+
+        bars2 = axes[1].bar(cats, kvs, color=PALETTE[:len(cats)])
+        axes[1].set_ylabel("Energy saving (kWh/yr)")
+        axes[1].set_title("Energy saving by technology")
+        for bar, v in zip(bars2, kvs):
+            axes[1].text(bar.get_x() + bar.get_width()/2, v + 50,
+                         f"{v:,.0f}", ha="center", fontsize=8, fontweight="bold")
+        axes[1].tick_params(axis="x", rotation=20)
+        axes[1].spines["top"].set_visible(False); axes[1].spines["right"].set_visible(False)
+
+        plt.tight_layout()
+        st.pyplot(fig, use_container_width=True); plt.close(fig)
+    else:
+        st.info("Run analyses in the HVAC, Lighting, Solar and Fabric tabs to populate this chart.")
+
+    # Summary table
+    sum_table = pd.DataFrame({
+        "Technology":        categories,
+        "Annual saving (kWh/yr)": kwh_values,
+        "Annual saving (GBP/yr)": cost_values,
+        "Carbon (tCO2e/yr)": [hvac_carbon, light_carbon, pv_carbon, shw_carbon, fab_carbon],
+        "CAPEX (GBP)":       [hvac_capex, light_capex, pv_capex, shw_capex, fab_capex],
+    })
+    sum_table["Payback (yrs)"] = sum_table.apply(
+        lambda row: row["CAPEX (GBP)"] / row["Annual saving (GBP/yr)"]
+        if row["Annual saving (GBP/yr)"] > 0 and row["CAPEX (GBP)"] > 0 else float("nan"),
+        axis=1
+    )
+    # Add totals row
+    totals_row = pd.DataFrame([{
+        "Technology": "TOTAL",
+        "Annual saving (kWh/yr)": total_saving_kwh,
+        "Annual saving (GBP/yr)": total_cost,
+        "Carbon (tCO2e/yr)":     total_carbon,
+        "CAPEX (GBP)":            total_capex,
+        "Payback (yrs)":          overall_payback,
+    }])
+    sum_table = pd.concat([sum_table, totals_row], ignore_index=True)
+    st.dataframe(
+        sum_table.style.format({
+            "Annual saving (kWh/yr)": "{:,.0f}", "Annual saving (GBP/yr)": "{:,.0f}",
+            "Carbon (tCO2e/yr)": "{:.1f}", "CAPEX (GBP)": "{:,.0f}",
+            "Payback (yrs)": "{:.1f}",
+        }, na_rep="—"),
+        use_container_width=True, hide_index=True
+    )
+
+    st.download_button(
+        "Download summary (CSV)",
+        sum_table.to_csv(index=False).encode(),
+        "energy_management_summary.csv", "text/csv",
     )

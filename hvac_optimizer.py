@@ -95,37 +95,56 @@ PRETTY = {
 # Financial helpers
 # ----------------------------------------------------------------------------
 def _npv(annual_saving: float, capex: float,
-         years: int = C.MEASURE_LIFETIME_YEARS, rate: float = C.DISCOUNT_RATE) -> float:
-    discounted = sum(annual_saving / (1 + rate) ** y for y in range(1, years + 1))
+         years: int        = C.MEASURE_LIFETIME_YEARS,
+         rate: float       = C.DISCOUNT_RATE,
+         degradation: float = C.DEGRADATION_RATE,
+         maintenance: float = 0.0) -> float:
+    """
+    NPV with year-by-year equipment degradation and annual maintenance cost.
+    net_year_n = annual_saving × (1 − degradation)^n − maintenance
+    """
+    discounted = sum(
+        (annual_saving * (1 - degradation) ** y - maintenance) / (1 + rate) ** y
+        for y in range(1, years + 1)
+    )
     return discounted - capex
 
 
-def evaluate(model, df: pd.DataFrame, sim_years: int = C.SIM_YEARS) -> pd.DataFrame:
+def evaluate(model, df: pd.DataFrame,
+             sim_years: int              = C.SIM_YEARS,
+             degradation_rate: float     = C.DEGRADATION_RATE,
+             maintenance_costs: dict     = None) -> pd.DataFrame:
     """Run every scenario through the surrogate and assemble the results table."""
+    if maintenance_costs is None:
+        maintenance_costs = C.MAINTENANCE_COSTS
+
     baseline_kwh = predict_annual_kwh(model, SCENARIOS["baseline"](df), sim_years)
     rows = []
     for key, builder in SCENARIOS.items():
-        scen = builder(df)
+        scen       = builder(df)
         annual_kwh = predict_annual_kwh(model, scen, sim_years)
-        saved_kwh = baseline_kwh - annual_kwh
-        pct = saved_kwh / baseline_kwh * 100
-        cost_saving = saved_kwh * C.ELECTRICITY_PRICE
-        carbon_saving = saved_kwh * C.CARBON_FACTOR / 1000  # tCO2e
-        capex = C.CAPEX.get(key, 0)
+        saved_kwh  = baseline_kwh - annual_kwh
+        pct        = saved_kwh / baseline_kwh * 100
+        cost_saving   = saved_kwh  * C.ELECTRICITY_PRICE
+        carbon_saving = saved_kwh  * C.CARBON_FACTOR / 1000
+        capex         = C.CAPEX.get(key, 0)
+        maintenance   = maintenance_costs.get(key, 0)
         payback = capex / cost_saving if cost_saving > 0 else np.nan
-        roi = cost_saving / capex * 100 if capex > 0 else np.nan
-        npv = _npv(cost_saving, capex) if capex > 0 else np.nan
+        roi     = cost_saving / capex * 100 if capex > 0 else np.nan
+        npv     = _npv(cost_saving, capex,
+                       degradation=degradation_rate,
+                       maintenance=maintenance) if capex > 0 else np.nan
         rows.append({
-            "scenario": PRETTY[key],
-            "annual_hvac_kwh": annual_kwh,
-            "energy_saved_kwh": max(saved_kwh, 0),
-            "saving_pct": max(pct, 0),
-            "cost_saving_gbp": max(cost_saving, 0),
+            "scenario":           PRETTY[key],
+            "annual_hvac_kwh":    annual_kwh,
+            "energy_saved_kwh":   max(saved_kwh, 0),
+            "saving_pct":         max(pct, 0),
+            "cost_saving_gbp":    max(cost_saving, 0),
             "carbon_saving_tco2e": max(carbon_saving, 0),
-            "capex_gbp": capex,
-            "payback_years": payback,
-            "roi_pct": roi,
-            "npv_15yr_gbp": npv,
+            "capex_gbp":          capex,
+            "payback_years":      payback,
+            "roi_pct":            roi,
+            "npv_15yr_gbp":       npv,
         })
     return pd.DataFrame(rows)
 
