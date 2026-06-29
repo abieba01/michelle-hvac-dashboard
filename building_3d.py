@@ -29,7 +29,7 @@ _FACADES = [
 
 def render(
     floor_area_m2: float,
-    height_m: float = C.DEFAULT_BUILDING_HEIGHT_M,
+    height_m: float = 12.0,
     facade_gains: dict[str, float] | None = None,
 ):
     """

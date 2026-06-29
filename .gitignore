@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+streamlit_test*.log
+test3d_output.png
