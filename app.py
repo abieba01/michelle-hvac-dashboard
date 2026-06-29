@@ -509,14 +509,25 @@ with tab_hvac:
         dl2.download_button("Scenario results",
             df_results.drop(columns=["key"]).to_csv(index=False).encode(),
             "hvac_scenario_results.csv", "text/csv")
-        dl3.download_button("Full PDF report",
-            generate_pdf(df_results, {
-                "elec_price": elec_price, "carbon_factor": carbon_factor,
-                "discount_rate": discount_rate, "lifetime": lifetime,
-                "capex_occ": capex_occ, "capex_therm": capex_therm,
-                "capex_bas": capex_bas, "capex_comb": capex_comb,
-            }, metrics, data_label),
-            "hvac_optimisation_report.pdf", "application/pdf")
+        with dl3:
+            if st.button("Generate PDF report", key="gen_pdf"):
+                pdf_assumptions = {
+                    "elec_price": elec_price, "carbon_factor": carbon_factor,
+                    "discount_rate": discount_rate, "lifetime": lifetime,
+                    "capex_occ": capex_occ, "capex_therm": capex_therm,
+                    "capex_bas": capex_bas, "capex_comb": capex_comb,
+                }
+                st.session_state["pdf_bytes"] = generate_pdf(
+                    df_results, pdf_assumptions, metrics, data_label
+                )
+            if "pdf_bytes" in st.session_state:
+                st.download_button(
+                    "Download PDF report",
+                    data=st.session_state["pdf_bytes"],
+                    file_name="hvac_optimisation_report.pdf",
+                    mime="application/pdf",
+                    key="dl_pdf",
+                )
 
     st.divider()
     col1, col2 = st.columns(2)
