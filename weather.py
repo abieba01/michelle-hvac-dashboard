@@ -70,7 +70,7 @@ def fetch_weather(lat: float, lon: float, years: int = 3) -> pd.DataFrame:
             "longitude":  lon,
             "start_date": start.isoformat(),
             "end_date":   end.isoformat(),
-            "hourly":     "temperature_2m,shortwave_radiation",
+            "hourly":     "temperature_2m,shortwave_radiation,wind_speed_10m",
             "timezone":   "auto",
         },
         timeout=30,
@@ -79,12 +79,13 @@ def fetch_weather(lat: float, lon: float, years: int = 3) -> pd.DataFrame:
     h = r.json()["hourly"]
 
     df = pd.DataFrame({
-        "timestamp": pd.to_datetime(h["time"]),
-        "t_out":     pd.array(h["temperature_2m"],    dtype="Float64"),
-        "solar_wm2": pd.array(h["shortwave_radiation"], dtype="Float64"),
+        "timestamp":  pd.to_datetime(h["time"]),
+        "t_out":      pd.array(h["temperature_2m"],     dtype="Float64"),
+        "solar_wm2":  pd.array(h["shortwave_radiation"], dtype="Float64"),
+        "wind_speed": pd.array(h.get("wind_speed_10m", [None] * len(h["time"])), dtype="Float64"),
     })
     df["solar"] = (df["solar_wm2"] / 900.0).clip(0, 1)
-    df = df.drop(columns=["solar_wm2"]).dropna().reset_index(drop=True)
+    df = df.drop(columns=["solar_wm2"]).dropna(subset=["t_out", "solar"]).reset_index(drop=True)
 
     # Trim/warn to keep exactly years × 8760 rows
     target = years * 8760

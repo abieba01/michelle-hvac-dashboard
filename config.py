@@ -136,3 +136,21 @@ EPC_BANDS = [
 MONTHLY_MEAN_TEMP = [5, 5.5, 7.5, 9.5, 12.5, 15.5,
                      17.5, 17, 14.5, 11, 7.5, 5.5]
 DAILY_TEMP_SWING = 6.0          # peak-to-trough diurnal swing
+
+# ----------------------------------------------------------------------------
+# Phase 3 — wind turbine defaults
+# ----------------------------------------------------------------------------
+WIND_LIFETIME_YEARS = 20            # turbine design life
+WIND_DEGRADATION    = 0.005         # 0.5 %/yr output degradation
+WIND_MIN_VIABLE_MS  = 5.0           # mean annual wind speed below which siting is flagged
+
+# ----------------------------------------------------------------------------
+# Phase 3 — solar gain / overheating defaults
+# ----------------------------------------------------------------------------
+TM52_ADAPTIVE_LIMIT_K = 28.0        # simplified CIBSE TM52 upper comfort temperature (deg C)
+TM52_EXCEEDANCE_HOURS_THRESHOLD = 50  # occupied hours above limit before overheating is flagged
+
+# ----------------------------------------------------------------------------
+# Phase 3 — 3D visualisation defaults
+# ----------------------------------------------------------------------------
+DEFAULT_BUILDING_HEIGHT_M = 12.0    # assumed building height for the block model

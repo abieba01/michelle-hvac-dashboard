@@ -1,7 +1,8 @@
 """
-app.py  —  Energy Management Dashboard (Phase 2)
+app.py  —  Energy Management Dashboard (Phase 3)
 =================================================
-Tabs: HVAC Control | LED Lighting | Solar Energy | Fabric | Summary
+Tabs: HVAC Control | LED Lighting | Renewables (PV/Solar HW/Wind) |
+      Fabric & Envelope | Solar Gain & Overheating | Full Summary
 Run: python -m streamlit run app.py
 """
 from __future__ import annotations
@@ -28,6 +29,9 @@ import epc_lookup as epc
 import solar_pv as spv
 import solar_thermal as sth
 import fabric as fab
+import wind as wd
+import solar_gain as sgain
+import building_3d as b3d
 
 st.set_page_config(
     page_title="Michelle's Project – Energy Management Dashboard",
@@ -89,6 +93,16 @@ def _get_weather(location: str, sim_years: int):
         return df, name, None
     except Exception as exc:
         return None, location, str(exc)
+
+
+@st.cache_data(show_spinner=False, ttl=86_400)
+def _get_latlon(location: str) -> tuple[float, float]:
+    """Latitude/longitude for solar position calculations (falls back to London)."""
+    try:
+        lat, lon, _ = wx.geocode(location)
+        return lat, lon
+    except Exception:
+        return 51.5, -0.12
 
 
 @st.cache_data(
@@ -456,8 +470,9 @@ total_building_kwh = baseline_hvac_kwh / max(PROFILES[building_type].get("hvac_k
 # ============================================================================
 # TABS
 # ============================================================================
-tab_hvac, tab_light, tab_solar, tab_fabric, tab_summary = st.tabs(
-    ["HVAC Control", "LED Lighting", "Solar Energy", "Fabric & Envelope", "Full Summary"]
+tab_hvac, tab_light, tab_solar, tab_fabric, tab_gain, tab_summary = st.tabs(
+    ["HVAC Control", "LED Lighting", "Renewables", "Fabric & Envelope",
+     "Solar Gain & Overheating", "Full Summary"]
 )
 
 
@@ -728,8 +743,10 @@ with tab_light:
 # TAB 3 — SOLAR ENERGY
 # ============================================================================
 with tab_solar:
-    st.subheader("Solar Energy Analysis")
-    sol_tab_pv, sol_tab_shw = st.tabs(["Solar Photovoltaic (PV)", "Solar Hot Water"])
+    st.subheader("Renewable Energy Analysis")
+    sol_tab_pv, sol_tab_shw, sol_tab_wind = st.tabs(
+        ["Solar Photovoltaic (PV)", "Solar Hot Water", "Wind Turbine"]
+    )
 
     # ── SOLAR PV ─────────────────────────────────────────────────────────────
     with sol_tab_pv:
@@ -856,6 +873,89 @@ with tab_solar:
                        f"{shw_r['payback_years']:.1f} yrs" if not math.isnan(shw_r['payback_years']) else "—")
             sm7.metric(f"NPV ({shw_lifetime} yr)", f"GBP {shw_r['npv_gbp']:,.0f}")
 
+    # ── WIND TURBINE ───────────────────────────────────────────────────────────
+    with sol_tab_wind:
+        st.markdown(
+            "Estimate generation from a small wind turbine using hourly wind speed "
+            "at the building's location, height-corrected to hub height."
+        )
+        w_c1, w_c2, w_c3 = st.columns(3)
+        with w_c1:
+            wind_capacity = st.number_input("Turbine rated capacity (kW)", 1.0, 500.0, 10.0, 1.0)
+            wind_type = st.selectbox(
+                "Turbine type",
+                options=list(wd.TURBINE_TYPES.keys()),
+                format_func=lambda k: wd.TURBINE_TYPES[k]["label"],
+            )
+            wind_hub_height = st.slider("Hub height (m)", 5, 60, 15, 1)
+        with w_c2:
+            wind_export_tariff = st.slider(
+                "SEG export tariff (GBP/kWh)", 0.04, 0.30, C.SOLAR_PV_EXPORT_TARIFF, 0.01,
+                key="wind_seg",
+            )
+            wind_capex_kw = st.slider(
+                "CAPEX (GBP/kW)", 1_000, 5_000, wd.TURBINE_TYPES["small"]["capex_per_kw"], 100,
+            )
+            wind_lifetime = st.slider(
+                "System lifetime (years)", 10, 25, C.WIND_LIFETIME_YEARS, 1, key="wind_life",
+            )
+        with w_c3:
+            st.info(
+                "**Site suitability**\n"
+                "Mean wind speed below 5 m/s at hub height is rarely cost-effective "
+                "for small wind.\n\n"
+                "Planning permission is normally required for building-mounted and "
+                "freestanding turbines."
+            )
+
+        if st.button("Calculate wind generation", type="primary", key="calc_wind"):
+            wind_r = wd.financials(
+                rated_capacity_kw        = wind_capacity,
+                hub_height_m             = wind_hub_height,
+                turbine_type             = wind_type,
+                building_type            = building_type,
+                building_annual_load_kwh = baseline_hvac_kwh,
+                elec_price               = elec_price,
+                export_tariff            = wind_export_tariff,
+                discount_rate            = discount_rate,
+                inflation_rate           = inflation_rate,
+                grant_pct                = float(grant_pct),
+                weather_df               = weather_df_for_solar,
+                lifetime_years           = wind_lifetime,
+                capex_per_kw             = float(wind_capex_kw),
+            )
+            st.session_state["wind_result"] = wind_r
+
+        if "wind_result" in st.session_state:
+            wind_r = st.session_state["wind_result"]
+            st.divider()
+            if not wind_r["site_suitable"]:
+                st.warning(
+                    f"⚠️ Site suitability warning: mean wind speed at hub height is only "
+                    f"{wind_r['mean_wind_speed_ms']:.1f} m/s (below the 5 m/s practical "
+                    f"viability threshold). Payback is likely to be very long."
+                )
+            wm1, wm2, wm3, wm4 = st.columns(4)
+            wm1.metric("Mean wind speed (hub)", f"{wind_r['mean_wind_speed_ms']:.1f} m/s")
+            wm2.metric("Annual generation",     f"{wind_r['annual_gen_kwh']:,.0f} kWh")
+            wm3.metric("Self-consumed",          f"{wind_r['self_consumed_kwh']:,.0f} kWh")
+            wm4.metric("Annual income",          f"GBP {wind_r['total_annual_income_gbp']:,.0f}")
+
+            wm5, wm6, wm7, wm8 = st.columns(4)
+            wm5.metric("Total CAPEX", f"GBP {wind_r['total_capex_gbp']:,.0f}")
+            wm6.metric("Payback",
+                       f"{wind_r['payback_years']:.1f} yrs" if not math.isnan(wind_r['payback_years']) else "—")
+            wm7.metric(f"NPV ({wind_lifetime} yr)", f"GBP {wind_r['npv_gbp']:,.0f}")
+            wm8.metric("IRR",
+                       f"{wind_r['irr_pct']:.1f}%" if not math.isnan(wind_r['irr_pct']) else "—")
+
+            st.metric("Carbon avoided", f"{wind_r['carbon_saved_tco2e']:.1f} tCO2e/yr")
+            st.caption(
+                "Planning permission is normally required for building-mounted and "
+                "freestanding wind turbines — check with your local planning authority "
+                "before proceeding."
+            )
+
 
 # ============================================================================
 # TAB 4 — FABRIC & ENVELOPE
@@ -968,6 +1068,131 @@ with tab_fabric:
 
 
 # ============================================================================
+# TAB — SOLAR GAIN & OVERHEATING (CIBSE TM52)
+# ============================================================================
+with tab_gain:
+    st.subheader("Solar Gain & Overheating Risk (CIBSE TM52)")
+    st.markdown(
+        "Physically-based hourly solar gain through glazing, by facade, using the "
+        "building's real solar position and weather data — replacing the simplified "
+        "sine-wave solar proxy used elsewhere in the model."
+    )
+
+    sg_c1, sg_c2 = st.columns([2, 1])
+    with sg_c2:
+        sg_orientation = st.slider(
+            "Building orientation (° from North)", 0, 359, 0, 5,
+            help="Rotates all facades together. 0° = front facade faces North.",
+        )
+        sg_shading = st.slider(
+            "External shading factor", 0.3, 1.0, 1.0, 0.05,
+            help="1.0 = no shading. Lower values represent overhangs, fins or blinds.",
+        )
+        sg_height = st.slider(
+            "Building height (m)", 3, 100, int(C.DEFAULT_BUILDING_HEIGHT_M), 1,
+        )
+    with sg_c1:
+        st.markdown("**Glazing per facade**")
+        facade_defs = [
+            {"label": "North", "base_azimuth": 0},
+            {"label": "East",  "base_azimuth": 90},
+            {"label": "South", "base_azimuth": 180},
+            {"label": "West",  "base_azimuth": 270},
+        ]
+        facade_inputs = []
+        fcols = st.columns(4)
+        for i, fd in enumerate(facade_defs):
+            with fcols[i]:
+                st.caption(fd["label"])
+                f_area = st.number_input(
+                    "Glazing area (m²)", 0.0, 2_000.0, 100.0, 10.0, key=f"sg_area_{fd['label']}"
+                )
+                f_gval = st.number_input(
+                    "g-value", 0.10, 0.90, 0.40, 0.05, key=f"sg_g_{fd['label']}"
+                )
+                facade_inputs.append({
+                    "label":           fd["label"],
+                    "azimuth_deg":     (fd["base_azimuth"] + sg_orientation) % 360,
+                    "glazing_area_m2": f_area,
+                    "g_value":         f_gval,
+                    "shading_factor":  sg_shading,
+                })
+
+    if st.button("Calculate solar gain", type="primary", key="calc_gain"):
+        if weather_df_for_solar is None:
+            st.error(
+                "Solar gain modelling needs real hourly weather data — switch Data "
+                "source to Synthetic or Upload, with a valid location."
+            )
+        else:
+            lat_g, lon_g = _get_latlon(location.strip() or "London")
+            st.session_state["gain_result"] = sgain.calculate(
+                weather_df    = weather_df_for_solar,
+                lat           = lat_g,
+                facades       = facade_inputs,
+                floor_area_m2 = floor_area,
+            )
+
+    if "gain_result" in st.session_state:
+        gain_r = st.session_state["gain_result"]
+        st.divider()
+        gm1, gm2, gm3 = st.columns(3)
+        gm1.metric("Total annual solar gain", f"{gain_r['total_annual_gain_kwh']:,.0f} kWh/yr")
+        gm2.metric(
+            "TM52 exceedance hours", f"{gain_r['exceedance_hours']:,} h/yr",
+            help=f"Occupied hours above the {gain_r['adaptive_limit_c']:.0f}°C adaptive comfort limit",
+        )
+        gm3.metric("Overheating risk", "⚠️ Flagged" if gain_r["overheating_flag"] else "✅ OK")
+
+        if gain_r["overheating_flag"]:
+            st.warning(
+                f"Overheating risk flagged: {gain_r['exceedance_hours']} occupied hours/yr "
+                f"exceed the CIBSE TM52 adaptive comfort threshold "
+                f"(>{C.TM52_EXCEEDANCE_HOURS_THRESHOLD} hours). Consider increased shading, "
+                f"reduced glazing g-value, or added thermal mass."
+            )
+
+        gain_table = pd.DataFrame([{
+            "Facade":                 r["label"],
+            "Azimuth (°)":            r["azimuth_deg"],
+            "Glazing area (m²)":      r["glazing_area_m2"],
+            "g-value":                r["g_value"],
+            "Shading factor":         r["shading_factor"],
+            "Annual gain (kWh/yr)":   r["annual_gain_kwh"],
+            "Peak irradiance (W/m²)": r["peak_irradiance_wm2"],
+        } for r in gain_r["facade_rows"]])
+        st.dataframe(
+            gain_table.style.format({
+                "Azimuth (°)": "{:.0f}", "Glazing area (m²)": "{:,.0f}",
+                "g-value": "{:.2f}", "Shading factor": "{:.2f}",
+                "Annual gain (kWh/yr)": "{:,.0f}", "Peak irradiance (W/m²)": "{:,.0f}",
+            }, na_rep="—"),
+            use_container_width=True, hide_index=True,
+        )
+
+        fig, ax = plt.subplots(figsize=(6, 3.5))
+        ax.bar(
+            [r["label"] for r in gain_r["facade_rows"]],
+            [r["annual_gain_kwh"] for r in gain_r["facade_rows"]],
+            color=PALETTE[:len(gain_r["facade_rows"])],
+        )
+        ax.set_ylabel("Annual solar gain (kWh/yr)")
+        ax.set_title("Solar gain by facade")
+        ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
+        plt.tight_layout()
+        st.pyplot(fig, use_container_width=True); plt.close(fig)
+
+        with st.expander("3D building visualisation", expanded=False):
+            facade_gains_map = {r["label"]: r["annual_gain_kwh"] for r in gain_r["facade_rows"]}
+            fig3d = b3d.render(floor_area, sg_height, facade_gains_map)
+            st.pyplot(fig3d, use_container_width=True); plt.close(fig3d)
+            st.caption(
+                "Illustrative block model — facades coloured by relative annual solar "
+                "gain. Not to architectural scale; cosmetic only."
+            )
+
+
+# ============================================================================
 # TAB 5 — FULL SUMMARY
 # ============================================================================
 with tab_summary:
@@ -1012,10 +1237,22 @@ with tab_summary:
         fab_capex      = fab_r["total_capex"]
         fab_carbon     = fab_r["total_carbon_tco2e"]
 
-    total_saving_kwh = hvac_saving_kwh + light_saving_kwh + pv_saving_kwh + shw_saving_kwh + fab_saving_kwh
-    total_cost       = hvac_cost + light_cost + pv_cost + shw_cost + fab_cost
-    total_capex      = hvac_capex + light_capex + pv_capex + shw_capex + fab_capex
-    total_carbon     = hvac_carbon + light_carbon + pv_carbon + shw_carbon + fab_carbon
+    wind_saving_kwh = 0.0; wind_cost = 0.0; wind_capex_tot = 0.0; wind_carbon = 0.0
+    if "wind_result" in st.session_state:
+        wind_r = st.session_state["wind_result"]
+        wind_saving_kwh = wind_r["self_consumed_kwh"]
+        wind_cost       = wind_r["total_annual_income_gbp"]
+        wind_capex_tot  = wind_r["total_capex_gbp"]
+        wind_carbon     = wind_r["carbon_saved_tco2e"]
+
+    total_saving_kwh = (hvac_saving_kwh + light_saving_kwh + pv_saving_kwh
+                        + shw_saving_kwh + fab_saving_kwh + wind_saving_kwh)
+    total_cost       = (hvac_cost + light_cost + pv_cost + shw_cost
+                        + fab_cost + wind_cost)
+    total_capex      = (hvac_capex + light_capex + pv_capex + shw_capex
+                        + fab_capex + wind_capex_tot)
+    total_carbon     = (hvac_carbon + light_carbon + pv_carbon + shw_carbon
+                        + fab_carbon + wind_carbon)
     overall_payback  = total_capex / total_cost if total_cost > 0 else float("nan")
 
     # KPI row
@@ -1058,9 +1295,9 @@ with tab_summary:
                     st.warning(f"EPC API lookup failed: {e}")
 
     # Stacked bar chart — savings by category
-    categories  = ["HVAC control", "LED lighting", "Solar PV", "Solar thermal", "Fabric"]
-    cost_values = [hvac_cost, light_cost, pv_cost, shw_cost, fab_cost]
-    kwh_values  = [hvac_saving_kwh, light_saving_kwh, pv_saving_kwh, shw_saving_kwh, fab_saving_kwh]
+    categories  = ["HVAC control", "LED lighting", "Solar PV", "Solar thermal", "Fabric", "Wind"]
+    cost_values = [hvac_cost, light_cost, pv_cost, shw_cost, fab_cost, wind_cost]
+    kwh_values  = [hvac_saving_kwh, light_saving_kwh, pv_saving_kwh, shw_saving_kwh, fab_saving_kwh, wind_saving_kwh]
 
     active_cats  = [(c, cv, kv) for c, cv, kv in zip(categories, cost_values, kwh_values) if cv > 0]
     if active_cats:
@@ -1098,8 +1335,8 @@ with tab_summary:
         "Technology":        categories,
         "Annual saving (kWh/yr)": kwh_values,
         "Annual saving (GBP/yr)": cost_values,
-        "Carbon (tCO2e/yr)": [hvac_carbon, light_carbon, pv_carbon, shw_carbon, fab_carbon],
-        "CAPEX (GBP)":       [hvac_capex, light_capex, pv_capex, shw_capex, fab_capex],
+        "Carbon (tCO2e/yr)": [hvac_carbon, light_carbon, pv_carbon, shw_carbon, fab_carbon, wind_carbon],
+        "CAPEX (GBP)":       [hvac_capex, light_capex, pv_capex, shw_capex, fab_capex, wind_capex_tot],
     })
     sum_table["Payback (yrs)"] = sum_table.apply(
         lambda row: row["CAPEX (GBP)"] / row["Annual saving (GBP/yr)"]
