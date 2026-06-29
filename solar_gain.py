@@ -149,8 +149,8 @@ def calculate(
     facades: list[dict],   # each: {label, azimuth_deg, glazing_area_m2, g_value, shading_factor}
     floor_area_m2: float,
     occupied_mask: np.ndarray | None = None,
-    adaptive_limit: float = C.TM52_ADAPTIVE_LIMIT_K,
-    exceedance_threshold: int = C.TM52_EXCEEDANCE_HOURS_THRESHOLD,
+    adaptive_limit: float = 28.0,
+    exceedance_threshold: int = 50,
 ) -> dict:
     """
     Compute hourly and annual solar gain across all facades, plus a simplified

@@ -150,8 +150,8 @@ def financials(
     inflation_rate: float,
     grant_pct: float,
     weather_df: pd.DataFrame | None = None,
-    lifetime_years: int = C.WIND_LIFETIME_YEARS,
-    degradation: float = C.WIND_DEGRADATION,
+    lifetime_years: int = 20,
+    degradation: float = 0.005,
     capex_per_kw: float | None = None,
 ) -> dict:
     """
