@@ -154,3 +154,33 @@ TM52_EXCEEDANCE_HOURS_THRESHOLD = 50  # occupied hours above limit before overhe
 # Phase 3 — 3D visualisation defaults
 # ----------------------------------------------------------------------------
 DEFAULT_BUILDING_HEIGHT_M = 12.0    # assumed building height for the block model
+
+# ----------------------------------------------------------------------------
+# Limitation 3 fix — thermal mass / construction type correction factors
+# hvac_factor: multiplier applied to the surrogate-model HVAC baseline and savings.
+# Heavy-mass buildings have lower HVAC demand than the lightweight default assumed
+# by the synthetic data generator (CIBSE AM11 / CIBSE KS6 informed estimates).
+# ----------------------------------------------------------------------------
+THERMAL_MASS: dict = {
+    "lightweight": {
+        "label":       "Lightweight (steel / timber / curtain-wall glazing)",
+        "hvac_factor": 1.00,
+        "description": "Fast thermal response. No diurnal buffering. "
+                       "Cooling peaks sharply in the afternoon.",
+    },
+    "medium": {
+        "label":       "Medium mass (brick / block / mixed construction)",
+        "hvac_factor": 0.94,
+        "description": "Moderate buffering. Typical UK brick-clad commercial building. "
+                       "~6% lower HVAC consumption than lightweight equivalent.",
+    },
+    "heavy": {
+        "label":       "Heavy mass (in-situ concrete frame / stone / pre-1980 stock)",
+        "hvac_factor": 0.87,
+        "description": "Strong diurnal buffering. ~13% lower HVAC consumption than "
+                       "lightweight. Night pre-cooling strategies particularly effective.",
+    },
+}
+
+# Default heating fuel (used for SBEM-like EPC scoring)
+DEFAULT_HEATING_FUEL = "gas"

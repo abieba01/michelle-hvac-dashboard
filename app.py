@@ -32,6 +32,7 @@ import fabric as fab
 import wind as wd
 import solar_gain as sgain
 import building_3d as b3d
+import planning_check as pc
 
 st.set_page_config(
     page_title="Michelle's Project – Energy Management Dashboard",
@@ -224,12 +225,41 @@ def _sample_xlsx_bytes() -> bytes:
     return buf.getvalue()
 
 
+def _confidence_badge(data_source: str, location: str) -> None:
+    """Limitation 1 — show data quality / screening disclaimer."""
+    if data_source == "Upload my own CSV":
+        quality, icon = "Your uploaded data", "✅"
+        detail = "Results are based on your uploaded hourly CSV. This improves accuracy but does not constitute a formal energy certificate."
+    elif data_source == "Monthly electricity bills":
+        quality, icon = "Meter regression (IPMVP Option B)", "📊"
+        detail = "HVAC baseline derived by degree-day regression on your monthly bills. Directionally accurate; formal measurement (Option A) is required for M&V compliance."
+    else:
+        quality, icon = "Synthetic / modelled data", "⚠️"
+        detail = "No real meter data supplied. Results use a machine-learning surrogate calibrated to building-type benchmarks."
+    loc_note = f" Location: {location}." if location.strip() else " No location set — using default weather."
+    st.info(
+        f"{icon} **Screening tool** — {quality}.{loc_note} "
+        f"{detail} "
+        "Results are indicative and should not be used as formal compliance evidence "
+        "without review by a qualified engineer. "
+        "[CIBSE guidance](https://www.cibse.org) | "
+        "[Non-domestic EPC register](https://epc.opendatacommunities.org)",
+        icon="ℹ️",
+    )
+
+
+@st.cache_data(show_spinner="Checking planning constraints…", ttl=3_600)
+def _check_planning(lat: float, lon: float) -> dict:
+    """Cached planning constraint check — re-runs at most once per hour."""
+    return pc.check(lat, lon)
+
+
 def _compute_results(energy, elec_price, carbon_factor, discount_rate, lifetime,
                      capex_map, degradation_rate, maintenance_map,
-                     inflation_rate=0.0, grant_pct=0.0):
+                     inflation_rate=0.0, grant_pct=0.0, thermal_mass_factor=1.0):
     rows = []
     for key, e in energy.items():
-        saved       = e["saved_kwh"]
+        saved       = e["saved_kwh"] * thermal_mass_factor
         cost        = saved * elec_price
         carbon      = saved * carbon_factor / 1000
         capex       = capex_map.get(key, 0)
@@ -245,7 +275,7 @@ def _compute_results(energy, elec_price, carbon_factor, discount_rate, lifetime,
         rows.append({
             "key":                      key,
             "Strategy":                 e["scenario"],
-            "Annual HVAC (kWh/yr)":     e["annual_kwh"],
+            "Annual HVAC (kWh/yr)":     e["annual_kwh"] * thermal_mass_factor,
             "Saved (kWh/yr)":           saved,
             "Saving (%)":               e["saving_pct"],
             "Cost saving (GBP/yr)":     cost,
@@ -288,11 +318,40 @@ with st.sidebar:
             ["A+", "A", "B", "C", "D", "E", "F", "G"],
             index=3,
         )
+        heating_fuel = st.selectbox(
+            "Primary heating fuel",
+            list(epc.FUEL_CO2_FACTORS.keys()),
+            index=1,  # gas
+            format_func=lambda k: {
+                "electricity": "Electricity", "gas": "Natural gas",
+                "oil": "Oil", "lpg": "LPG",
+                "heat_pump": "Heat pump (electricity)",
+                "biomass": "Biomass", "district_heat": "District heating",
+            }.get(k, k.title()),
+            help="Used for the SBEM-like EPC score calculation in the Full Summary tab.",
+        )
         epc_api_key = st.text_input("EPC API key (optional)", type="password",
                                     help="Free from epc.opendatacommunities.org — "
                                          "leave blank to use manual band above.")
         epc_email   = st.text_input("EPC API email (optional)",
                                     help="Email registered with the EPC portal.")
+
+    # ── Construction type (Limitation 3 — thermal mass fix) ─────────────────
+    with st.expander("Construction type (thermal mass)"):
+        construction_type = st.selectbox(
+            "Construction type",
+            list(C.THERMAL_MASS.keys()),
+            format_func=lambda k: C.THERMAL_MASS[k]["label"],
+            help="Affects the HVAC baseline — heavier construction naturally reduces "
+                 "HVAC demand through thermal buffering.",
+        )
+        st.caption(C.THERMAL_MASS[construction_type]["description"])
+        if construction_type != "lightweight":
+            factor = C.THERMAL_MASS[construction_type]["hvac_factor"]
+            st.caption(
+                f"HVAC baseline correction: ×{factor:.2f} "
+                f"({(1-factor)*100:.0f}% lower than lightweight equivalent)."
+            )
 
     st.divider()
 
@@ -445,6 +504,12 @@ if profile["is_247"]:
 
 st.caption(f"{data_label}  |  Surrogate model R² = {metrics['r2']:.4f}")
 
+# Limitation 1 — screening tool disclaimer / data confidence badge
+_confidence_badge(data_source, location)
+
+# Limitation 3 — thermal mass correction factor
+thermal_mass_factor: float = C.THERMAL_MASS[construction_type]["hvac_factor"]
+
 # Prepare shared financial inputs
 capex_map = {
     "occupancy_scheduling": capex_occ, "smart_thermostats": capex_therm,
@@ -457,13 +522,14 @@ maintenance_map = {
 
 df_results = _compute_results(
     energy, elec_price, carbon_factor, discount_rate, lifetime,
-    capex_map, degradation_rate, maintenance_map, inflation_rate, grant_pct
+    capex_map, degradation_rate, maintenance_map, inflation_rate, grant_pct,
+    thermal_mass_factor=thermal_mass_factor,
 )
 non_bl = df_results[df_results["key"] != "baseline"].copy()
 best   = non_bl.sort_values("Cost saving (GBP/yr)", ascending=False).iloc[0]
 
-# Baseline HVAC kWh (for solar self-consumption calculations)
-baseline_hvac_kwh = energy["baseline"]["annual_kwh"]
+# Baseline HVAC kWh — scaled by thermal mass factor (Limitation 3)
+baseline_hvac_kwh = energy["baseline"]["annual_kwh"] * thermal_mass_factor
 total_building_kwh = baseline_hvac_kwh / max(PROFILES[building_type].get("hvac_kwh_m2", 100) / 100 * 0.45, 0.1)
 
 
@@ -748,6 +814,41 @@ with tab_light:
 # ============================================================================
 with tab_solar:
     st.subheader("Renewable Energy Analysis")
+
+    # ── Limitation 4 fix — planning constraint check ─────────────────────────
+    with st.expander("Planning & grid connection check for this location", expanded=True):
+        if not location.strip():
+            st.info("Enter a postcode or city in the sidebar to run the planning check.")
+            _plan = None
+        else:
+            _lat_p, _lon_p = _get_latlon(location.strip())
+            _plan = _check_planning(_lat_p, _lon_p)
+            if _plan["api_error"]:
+                st.warning(
+                    "Planning Data API could not be reached — results below are based "
+                    "on general UK Permitted Development rules only."
+                )
+            if _plan["constraints"]:
+                st.error(
+                    f"Planning constraints detected near **{location.strip()}**: "
+                    f"{', '.join(_plan['constraints'])}. "
+                    "Additional consents are likely required — see details below."
+                )
+            else:
+                st.success(
+                    "No statutory planning designations detected within 200 m of "
+                    f"**{location.strip()}**. Standard Permitted Development rules apply."
+                )
+            if _plan["restrictions"]:
+                st.markdown("**Technology-specific planning notes:**")
+                for note in _plan["restrictions"]:
+                    st.markdown(f"- {note}")
+            st.caption(
+                "Source: Planning Data API (planning.data.gov.uk). "
+                "This is a screening check only — always verify with your Local Planning Authority "
+                "before committing to an installation."
+            )
+
     sol_tab_pv, sol_tab_shw, sol_tab_wind = st.tabs(
         ["Solar Photovoltaic (PV)", "Solar Hot Water", "Wind Turbine"]
     )
@@ -821,6 +922,13 @@ with tab_solar:
             ax.set_title("Annual income breakdown")
             plt.tight_layout()
             st.pyplot(fig, use_container_width=True); plt.close(fig)
+
+            # Grid connection notes (Limitation 4)
+            grid_notes = pc.grid_connection_notes(capacity_kwp=pv_capacity)
+            if grid_notes:
+                with st.expander("Grid connection guidance (DNO)", expanded=False):
+                    for note in grid_notes:
+                        st.markdown(f"- {note}")
 
     # ── SOLAR HOT WATER ───────────────────────────────────────────────────────
     with sol_tab_shw:
@@ -954,11 +1062,12 @@ with tab_solar:
                        f"{wind_r['irr_pct']:.1f}%" if not math.isnan(wind_r['irr_pct']) else "—")
 
             st.metric("Carbon avoided", f"{wind_r['carbon_saved_tco2e']:.1f} tCO2e/yr")
-            st.caption(
-                "Planning permission is normally required for building-mounted and "
-                "freestanding wind turbines — check with your local planning authority "
-                "before proceeding."
-            )
+            # Grid connection notes for wind (Limitation 4)
+            grid_notes_w = pc.grid_connection_notes(turbine_kw=wind_capacity)
+            if grid_notes_w:
+                with st.expander("Grid connection guidance (DNO)", expanded=False):
+                    for note in grid_notes_w:
+                        st.markdown(f"- {note}")
 
 
 # ============================================================================
@@ -1270,20 +1379,51 @@ with tab_summary:
 
     st.divider()
 
-    # EPC projection
-    with st.expander("EPC band projection", expanded=True):
-        current_score  = epc.band_to_midpoint(epc_band_input)
-        total_intensity= baseline_hvac_kwh / max(floor_area, 1)
-        epc_score_now  = epc.kwh_m2_to_score(total_intensity * (1 / 0.45), building_type)
-        saving_vs_total = (total_saving_kwh / max(baseline_hvac_kwh * (1/0.45), 1)) * 100
-        new_band, new_score = epc.project_new_band(
-            epc.band_to_midpoint(epc_band_input), saving_vs_total
+    # EPC projection — improved SBEM-like scoring (Limitation 2 fix)
+    with st.expander("EPC band projection (SBEM-like carbon-weighted scoring)", expanded=True):
+        # Derive intensities (kWh/m²/yr) for each end-use
+        _hvac_intensity    = baseline_hvac_kwh / max(floor_area, 1)
+        _light_intensity   = light_saving_kwh  / max(floor_area, 1) if light_saving_kwh else 0.0
+        _pv_offset_m2      = (pv_saving_kwh  / max(floor_area, 1)) if pv_saving_kwh  else 0.0
+        _wind_offset_m2    = (wind_saving_kwh / max(floor_area, 1)) if wind_saving_kwh else 0.0
+        _dhw_intensity     = float(C.DHW_INTENSITY_KWH_M2.get(building_type, 5))
+        _other_intensity   = _hvac_intensity * 0.30  # approx small power share
+
+        # Current state — unimproved
+        _score_now, _band_now = epc.sbem_asset_rating(
+            hvac_kwh_m2    = _hvac_intensity,
+            lighting_kwh_m2 = _light_intensity * 1.5,  # pre-LED estimate
+            dhw_kwh_m2     = _dhw_intensity,
+            other_kwh_m2   = _other_intensity,
+            building_type  = building_type,
+            heating_fuel   = heating_fuel,
         )
-        ep1, ep2, ep3 = st.columns(3)
-        ep1.metric("Current EPC band (manual input)", epc_band_input)
-        ep2.metric("Estimated saving vs total energy", f"{saving_vs_total:.0f}%")
-        ep3.metric("Projected EPC band after improvements", new_band,
+
+        # After all improvements
+        _hvac_saving_pct   = float(best["Saving (%)"]) if not math.isnan(float(best.get("Saving (%)", 0))) else 0.0
+        _light_saving_pct  = (light_saving_kwh / max(light_saving_kwh / 0.5, 1)) * 100 if light_saving_kwh else 0.0
+        _new_band, _new_score, _narrative = epc.project_band_sbem(
+            current_score      = _score_now,
+            hvac_saving_pct    = _hvac_saving_pct,
+            lighting_saving_pct= _light_saving_pct,
+            pv_offset_kwh_m2   = _pv_offset_m2,
+            wind_offset_kwh_m2 = _wind_offset_m2,
+            floor_area_m2      = floor_area,
+            building_type      = building_type,
+            heating_fuel       = heating_fuel,
+        )
+
+        ep1, ep2, ep3, ep4 = st.columns(4)
+        ep1.metric("Manual EPC band (entered)", epc_band_input)
+        ep2.metric("Model-estimated current score", f"{_score_now:.0f}", _band_now)
+        ep3.metric("Projected score after improvements", f"{_new_score:.0f}")
+        ep4.metric("Projected EPC band", _new_band,
                    delta=f"from {epc_band_input}")
+        st.caption(
+            f"Methodology: simplified SBEM carbon-weighted BEP. Heating fuel: {heating_fuel}. "
+            f"{_narrative} "
+            "A registered EPC assessor is required for formal MEES compliance evidence."
+        )
         if epc_api_key and epc_email and location:
             with st.spinner("Checking EPC register…"):
                 try:
