@@ -475,6 +475,10 @@ tab_hvac, tab_light, tab_solar, tab_fabric, tab_gain, tab_summary = st.tabs(
      "Solar Gain & Overheating", "Full Summary"]
 )
 
+# Initialise variables that are set inside tab blocks but referenced in later tabs,
+# so they are always defined regardless of execution order or early errors.
+zone_results: list = []
+
 
 # ============================================================================
 # TAB 1 — HVAC CONTROL
