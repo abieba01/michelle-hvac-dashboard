@@ -30,7 +30,7 @@ FUEL_CO2_FACTORS: dict[str, float] = {
     "district_heat": 0.175,
 }
 
-# Reference BEP (kgCO2/m²/yr) calibrated so that a CIBSE TM46 "typical" building
+# Reference BEP (kgCO2/m2/yr) calibrated so that a CIBSE TM46 "typical" building
 # (not good practice, not poor) scores approximately 100-115 (Band D).
 # A good-practice building scores ~75 (Band B/C), and a poor building ~140 (Band E/F).
 # Calibrated against CIBSE TM46 benchmarks and typical UK carbon intensities.
@@ -86,7 +86,7 @@ def project_new_band(current_score: float, saving_pct: float) -> tuple[str, floa
 
 def kwh_m2_to_score(kwh_m2: float, building_type: str = "office") -> float:
     """
-    Approximate non-domestic asset rating score from total kWh/m²/yr.
+    Approximate non-domestic asset rating score from total kWh/m2/yr.
     Legacy helper — use sbem_asset_rating() for fuel-weighted accuracy.
     """
     benchmarks = {
@@ -111,21 +111,21 @@ def sbem_asset_rating(
     Simplified SBEM-like non-domestic asset rating.
 
     Converts energy use by fuel to a carbon-weighted Building Energy Performance
-    (BEP, kgCO2/m²/yr) and divides by the reference BEP for the building type.
+    (BEP, kgCO2/m2/yr) and divides by the reference BEP for the building type.
     This is directionally equivalent to the SBEM NCM approach and correctly
     reflects fuel-switching and on-site generation in a way the kWh-only
     heuristic cannot.
 
     Parameters
     ----------
-    hvac_kwh_m2       : HVAC energy intensity (kWh/m²/yr, post-improvement)
-    lighting_kwh_m2   : Lighting energy intensity (kWh/m²/yr)
-    dhw_kwh_m2        : Domestic hot water energy intensity (kWh/m²/yr)
-    other_kwh_m2      : Small power / equipment (kWh/m²/yr)
+    hvac_kwh_m2       : HVAC energy intensity (kWh/m2/yr, post-improvement)
+    lighting_kwh_m2   : Lighting energy intensity (kWh/m2/yr)
+    dhw_kwh_m2        : Domestic hot water energy intensity (kWh/m2/yr)
+    other_kwh_m2      : Small power / equipment (kWh/m2/yr)
     building_type     : building type key — determines reference BEP
     heating_fuel      : fuel used for heating ('gas', 'electricity', 'heat_pump', etc.)
-    pv_offset_kwh_m2  : on-site PV generation consumed on site (kWh/m²/yr) — reduces CO2
-    wind_offset_kwh_m2: on-site wind generation consumed on site (kWh/m²/yr)
+    pv_offset_kwh_m2  : on-site PV generation consumed on site (kWh/m2/yr) — reduces CO2
+    wind_offset_kwh_m2: on-site wind generation consumed on site (kWh/m2/yr)
 
     Returns
     -------
@@ -167,8 +167,8 @@ def project_band_sbem(
     current_score        : asset rating score before improvements
     hvac_saving_pct      : HVAC energy saving as a % of HVAC baseline
     lighting_saving_pct  : lighting energy saving as a % of lighting baseline
-    pv_offset_kwh_m2     : on-site PV generation self-consumed (kWh/m²/yr)
-    wind_offset_kwh_m2   : on-site wind generation self-consumed (kWh/m²/yr)
+    pv_offset_kwh_m2     : on-site PV generation self-consumed (kWh/m2/yr)
+    wind_offset_kwh_m2   : on-site wind generation self-consumed (kWh/m2/yr)
     building_type        : determines reference BEP
     heating_fuel         : fuel used for heating — affects carbon weight of HVAC saving
 
@@ -179,7 +179,7 @@ def project_band_sbem(
     elec_co2 = FUEL_CO2_FACTORS["electricity"]
 
     # Reconstruct current BEP from score
-    current_bep = current_score * ref_bep / 100.0  # kgCO2/m²/yr
+    current_bep = current_score * ref_bep / 100.0  # kgCO2/m2/yr
 
     # HVAC saving: HVAC carbon is ~55% of total BEP for a gas-heated building.
     # Adjust the share by the relative carbon factor vs electricity to
@@ -190,7 +190,7 @@ def project_band_sbem(
     # Lighting saving: electricity, ~15% of total BEP
     light_co2_saved = current_bep * 0.15 * (lighting_saving_pct / 100)
 
-    # On-site renewables: direct kgCO2/m²/yr credit at grid electricity factor
+    # On-site renewables: direct kgCO2/m2/yr credit at grid electricity factor
     pv_co2_credit   = pv_offset_kwh_m2   * elec_co2
     wind_co2_credit = wind_offset_kwh_m2 * elec_co2
 
@@ -201,12 +201,12 @@ def project_band_sbem(
 
     drivers: list[str] = []
     if hvac_saving_pct > 0:
-        drivers.append(f"HVAC control −{hvac_saving_pct:.0f}%")
+        drivers.append(f"HVAC control -{hvac_saving_pct:.0f}%")
     if lighting_saving_pct > 0:
-        drivers.append(f"LED lighting −{lighting_saving_pct:.0f}%")
+        drivers.append(f"LED lighting -{lighting_saving_pct:.0f}%")
     if pv_offset_kwh_m2 > 0 or wind_offset_kwh_m2 > 0:
         total_re = pv_offset_kwh_m2 + wind_offset_kwh_m2
-        drivers.append(f"renewables −{total_re:.1f} kWh/m²/yr")
+        drivers.append(f"renewables -{total_re:.1f} kWh/m2/yr")
     narrative = (
         f"Projected score {new_score:.0f} ({new_band}) from {current_score:.0f} "
         f"({score_to_band(current_score)}) after: {', '.join(drivers)}. "
