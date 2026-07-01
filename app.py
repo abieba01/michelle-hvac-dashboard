@@ -318,10 +318,12 @@ with st.sidebar:
             ["A+", "A", "B", "C", "D", "E", "F", "G"],
             index=3,
         )
+        _fuel_options = list(getattr(epc, "FUEL_CO2_FACTORS",
+                                         {"electricity": 0.207, "gas": 0.203}).keys())
         heating_fuel = st.selectbox(
             "Primary heating fuel",
-            list(epc.FUEL_CO2_FACTORS.keys()),
-            index=1,  # gas
+            _fuel_options,
+            index=min(1, len(_fuel_options) - 1),  # gas
             format_func=lambda k: {
                 "electricity": "Electricity", "gas": "Natural gas",
                 "oil": "Oil", "lpg": "LPG",
